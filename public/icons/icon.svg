@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="100" fill="#0a1628"/>
+  <circle cx="256" cy="220" r="120" fill="#4fc3f7" opacity="0.15"/>
+  <!-- Bird body -->
+  <ellipse cx="240" cy="260" rx="90" ry="60" fill="#4fc3f7"/>
+  <!-- Head -->
+  <circle cx="310" cy="210" r="40" fill="#4fc3f7"/>
+  <!-- Eye -->
+  <circle cx="322" cy="202" r="8" fill="#0a1628"/>
+  <circle cx="324" cy="200" r="3" fill="white"/>
+  <!-- Beak -->
+  <polygon points="350,210 380,205 350,218" fill="#ffa726"/>
+  <!-- Wing -->
+  <ellipse cx="220" cy="250" rx="65" ry="35" fill="#1a6d8a" transform="rotate(-10 220 250)"/>
+  <!-- Tail -->
+  <polygon points="150,260 110,230 120,270 110,290 150,280" fill="#1a6d8a"/>
+  <!-- Legs -->
+  <line x1="250" y1="310" x2="240" y2="360" stroke="#ffa726" stroke-width="4"/>
+  <line x1="270" y1="310" x2="280" y2="360" stroke="#ffa726" stroke-width="4"/>
+  <!-- Text -->
+  <text x="256" y="430" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="48" font-weight="700" fill="#e8edf5">TICKER</text>
+</svg>

@@ -1,0 +1,5 @@
+node_modules
+proxy/node_modules
+.git
+PLAN.md
+*.md

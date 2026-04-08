@@ -1,0 +1,9 @@
+{
+  "name": "bird-ticker",
+  "version": "1.0.0",
+  "description": "Bird Ticker PWA - Track missing birds from your Danish tick list",
+  "scripts": {
+    "start": "cd proxy && node server.js",
+    "install-deps": "cd proxy && npm install"
+  }
+}

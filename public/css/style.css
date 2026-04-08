@@ -1,0 +1,582 @@
+/* ─── Reset & Base ─────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #0a1628;
+  --bg-card: #111d33;
+  --bg-card-highlight: #1a2a45;
+  --text: #e8edf5;
+  --text-dim: #7a8ba8;
+  --accent: #4fc3f7;
+  --accent-dim: #1a6d8a;
+  --red: #ef5350;
+  --orange: #ffa726;
+  --green: #66bb6a;
+  --yellow: #ffee58;
+  --border: #1e3050;
+  --safe-top: env(safe-area-inset-top);
+  --safe-bottom: env(safe-area-inset-bottom);
+}
+
+html, body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+
+body {
+  padding-top: var(--safe-top);
+  padding-bottom: var(--safe-bottom);
+}
+
+/* ─── Header ───────────────────────────────────────────────────── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 100;
+}
+
+.header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header h1 .emoji {
+  font-size: 24px;
+}
+
+.header-actions {
+  display: flex;
+  gap: 12px;
+}
+
+.icon-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 8px;
+  transition: all 0.2s;
+}
+
+.icon-btn:active {
+  background: var(--bg-card);
+  color: var(--accent);
+}
+
+/* ─── Stats Bar ────────────────────────────────────────────────── */
+.stats-bar {
+  display: flex;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.stat {
+  flex: 1;
+  background: var(--bg-card);
+  border-radius: 12px;
+  padding: 12px;
+  text-align: center;
+}
+
+.stat-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.stat-value.alert {
+  color: var(--red);
+}
+
+.stat-value.green {
+  color: var(--green);
+}
+
+.stat-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ─── Tabs ─────────────────────────────────────────────────────── */
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  padding: 0 20px;
+}
+
+.tab {
+  flex: 1;
+  padding: 12px 0;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-dim);
+  border: none;
+  background: none;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* ─── Sort Bar ─────────────────────────────────────────────────── */
+.sort-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.sort-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.sort-btn {
+  padding: 6px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+
+.sort-btn.active {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+.sort-btn:active {
+  opacity: 0.7;
+}
+
+/* ─── Alert Cards ──────────────────────────────────────────────── */
+.card-list {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.bird-card {
+  background: var(--bg-card);
+  border-radius: 14px;
+  padding: 14px 16px;
+  border-left: 4px solid var(--red);
+  transition: background 0.2s;
+}
+
+.bird-card:active {
+  background: var(--bg-card-highlight);
+}
+
+.bird-card.rare {
+  border-left-color: var(--red);
+  background: linear-gradient(135deg, rgba(239, 83, 80, 0.08), var(--bg-card));
+}
+
+.bird-card.scarce {
+  border-left-color: var(--orange);
+}
+
+.bird-card.seasonal {
+  border-left-color: var(--yellow);
+}
+
+.bird-card.normal {
+  border-left-color: var(--accent);
+}
+
+.bird-card .card-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.bird-card .species-name {
+  font-size: 17px;
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+
+.bird-card .species-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.bird-card .species-link:active {
+  color: var(--accent);
+}
+
+.bird-card .latin-name {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-style: italic;
+  margin-bottom: 10px;
+}
+
+.bird-card .distance-badge {
+  flex-shrink: 0;
+  background: rgba(79, 195, 247, 0.15);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+
+.bird-card .details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.bird-card .details span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.bird-card .map-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.bird-card .map-link:active {
+  opacity: 0.7;
+}
+
+.bird-card .badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+.badge-rare {
+  background: rgba(239, 83, 80, 0.2);
+  color: var(--red);
+}
+
+.badge-scarce {
+  background: rgba(255, 167, 38, 0.2);
+  color: var(--orange);
+}
+
+.badge-seasonal {
+  background: rgba(255, 238, 88, 0.2);
+  color: var(--yellow);
+}
+
+/* ─── All Birds List ───────────────────────────────────────────── */
+.bird-list-item {
+  display: flex;
+  align-items: center;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  gap: 12px;
+}
+
+a.bird-list-item {
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+a.bird-list-item:active {
+  background: var(--bg-card);
+}
+
+.bird-list-item .tick {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.bird-list-item .tick.yes {
+  background: rgba(102, 187, 106, 0.15);
+  color: var(--green);
+}
+
+.bird-list-item .tick.no {
+  background: rgba(239, 83, 80, 0.15);
+  color: var(--red);
+}
+
+.bird-list-item .bird-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.bird-list-item .bird-name {
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bird-list-item .bird-latin {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.bird-list-item .link-arrow {
+  font-size: 22px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  padding-left: 4px;
+}
+
+.bird-list-item.removed {
+  opacity: 0.4;
+}
+
+/* ─── Settings ─────────────────────────────────────────────────── */
+.settings-panel {
+  padding: 20px;
+  display: none;
+}
+
+.settings-panel.visible {
+  display: block;
+}
+
+.settings-panel h2 {
+  font-size: 18px;
+  margin-bottom: 20px;
+}
+
+.form-group {
+  margin-bottom: 20px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 16px;
+  -webkit-appearance: none;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.form-group .hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 6px;
+}
+
+.btn {
+  width: 100%;
+  padding: 14px;
+  border-radius: 12px;
+  border: none;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.btn-primary:active {
+  background: var(--accent-dim);
+}
+
+.btn-secondary {
+  background: var(--bg-card);
+  color: var(--text);
+  margin-top: 10px;
+}
+
+/* ─── Search Bar ───────────────────────────────────────────────── */
+.search-bar {
+  padding: 12px 20px;
+}
+
+.search-bar input {
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 15px;
+}
+
+.search-bar input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.search-bar input::placeholder {
+  color: var(--text-dim);
+}
+
+/* ─── Loading & Empty States ───────────────────────────────────── */
+.loading, .empty-state, .error-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--text-dim);
+}
+
+.loading .spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin: 0 auto 16px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.empty-state .emoji {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+
+.error-state .emoji {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+
+/* ─── Footer ───────────────────────────────────────────────────── */
+.footer {
+  text-align: center;
+  padding: 20px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.footer .refresh-time {
+  margin-bottom: 4px;
+}
+
+/* ─── Toast ────────────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  bottom: calc(20px + var(--safe-bottom));
+  left: 50%;
+  transform: translateX(-50%) translateY(100px);
+  background: var(--bg-card-highlight);
+  color: var(--text);
+  padding: 12px 24px;
+  border-radius: 12px;
+  font-size: 14px;
+  font-weight: 500;
+  z-index: 1000;
+  transition: transform 0.3s ease;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.toast.visible {
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ─── Responsive ───────────────────────────────────────────────── */
+@media (min-width: 600px) {
+  body {
+    max-width: 480px;
+    margin: 0 auto;
+    border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+  }
+}
+
+/* ─── Animations ───────────────────────────────────────────────── */
+.bird-card {
+  animation: slideUp 0.3s ease both;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.bird-card:nth-child(2) { animation-delay: 0.05s; }
+.bird-card:nth-child(3) { animation-delay: 0.1s; }
+.bird-card:nth-child(4) { animation-delay: 0.15s; }
+.bird-card:nth-child(5) { animation-delay: 0.2s; }
