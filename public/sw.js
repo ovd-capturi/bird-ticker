@@ -1,4 +1,4 @@
-const CACHE_NAME = "bird-ticker-v1";
+const CACHE_NAME = "bird-ticker-v2";
 const STATIC_ASSETS = [
   "/",
   "/index.html",
@@ -31,13 +31,11 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
-  // API calls: network only (don't cache dynamic data in SW)
   if (url.pathname.startsWith("/api/")) {
     event.respondWith(fetch(event.request));
     return;
   }
 
-  // Static assets: cache first, fallback to network
   event.respondWith(
     caches.match(event.request).then((cached) => {
       return cached || fetch(event.request).then((response) => {
@@ -45,6 +43,56 @@ self.addEventListener("fetch", (event) => {
         caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
         return response;
       });
+    })
+  );
+});
+
+// ─── Push Notification ─────────────────────────────────────────
+self.addEventListener("push", (event) => {
+  let data = { title: "🐦 Bird Ticker", body: "Nye observationer!" };
+
+  if (event.data) {
+    try {
+      data = event.data.json();
+    } catch {
+      data.body = event.data.text();
+    }
+  }
+
+  const options = {
+    body: data.body,
+    icon: "/icons/icon.svg",
+    badge: "/icons/icon.svg",
+    tag: "bird-ticker-alert",
+    renotify: true,
+    data: data.data || { url: "/" },
+    actions: [
+      { action: "open", title: "Åbn app" },
+      { action: "dismiss", title: "Luk" },
+    ],
+  };
+
+  event.waitUntil(self.registration.showNotification(data.title, options));
+});
+
+// ─── Notification Click ────────────────────────────────────────
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+
+  if (event.action === "dismiss") return;
+
+  const url = event.notification.data?.url || "/";
+
+  event.waitUntil(
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
+      // Focus existing window if open
+      for (const client of clientList) {
+        if (client.url.includes(self.location.origin) && "focus" in client) {
+          return client.focus();
+        }
+      }
+      // Otherwise open new window
+      return clients.openWindow(url);
     })
   );
 });

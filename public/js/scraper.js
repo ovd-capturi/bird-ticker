@@ -219,7 +219,29 @@ const Scraper = {
   // Get Apple Maps / Google Maps URL for coordinates
   getMapUrl(lat, lng, label) {
     if (lat == null || lng == null) return null;
-    // Apple Maps on iOS, falls back to Google Maps elsewhere
     return `https://maps.apple.com/?q=${encodeURIComponent(label || "Fugl")}&ll=${lat},${lng}&z=14`;
+  },
+
+  // ─── Push Notifications ────────────────────────────────────
+  async getVapidKey() {
+    const res = await fetch(`${API_BASE}/api/push/vapid-key`);
+    const data = await res.json();
+    return data.publicKey;
+  },
+
+  async subscribePush(subscription, userId, listType) {
+    await fetch(`${API_BASE}/api/push/subscribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subscription, userId, listType }),
+    });
+  },
+
+  async unsubscribePush(endpoint) {
+    await fetch(`${API_BASE}/api/push/unsubscribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoint }),
+    });
   },
 };

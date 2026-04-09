@@ -1,13 +1,27 @@
 const express = require("express");
 const cheerio = require("cheerio");
 const iconv = require("iconv-lite");
+const webpush = require("web-push");
 const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// VAPID keys for push notifications
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC || "BCSf4An6NXJ55JAhdKchlCSrftouKF6D3G4Uhi5idkfIgMgNqJeOksh-NOS-QT7yqq3Hh_4c1IRsi7Xreq_dLVM";
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE || "E99i35Z9VdS7HkqRPU2jCgpoju5K6lUWIbaVRaz0_Gg";
+
+webpush.setVapidDetails(
+  "mailto:bird-ticker@example.com",
+  VAPID_PUBLIC,
+  VAPID_PRIVATE
+);
+
 // Cache stores
 const cache = new Map();
+
+// Push subscription store: Map<subKey, { subscription, userId, listType, lastAlertKeys }>
+const subscribers = new Map();
 const TICK_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 const OBS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
@@ -20,6 +34,9 @@ function getCached(key, ttl) {
 function setCache(key, data) {
   cache.set(key, { data, time: Date.now() });
 }
+
+// JSON body parsing for push subscription
+app.use(express.json());
 
 // Serve static frontend files
 app.use(express.static(path.join(__dirname, "..", "public")));
@@ -391,6 +408,251 @@ app.get("/api/localities", async (req, res) => {
   res.json(results);
 });
 
+// ─── Push: VAPID public key endpoint ──────────────────────────────────
+app.get("/api/push/vapid-key", (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC });
+});
+
+// ─── Push: Subscribe ──────────────────────────────────────────────────
+app.post("/api/push/subscribe", (req, res) => {
+  const { subscription, userId, listType } = req.body;
+  if (!subscription || !userId) {
+    return res.status(400).json({ error: "subscription and userId required" });
+  }
+
+  const subKey = subscription.endpoint;
+  subscribers.set(subKey, {
+    subscription,
+    userId,
+    listType: listType || "1",
+    lastAlertKeys: new Set(),
+  });
+
+  console.log(`📬 Push subscription added for user ${userId} (${subscribers.size} total)`);
+  res.json({ ok: true });
+});
+
+// ─── Push: Unsubscribe ────────────────────────────────────────────────
+app.post("/api/push/unsubscribe", (req, res) => {
+  const { endpoint } = req.body;
+  if (endpoint) subscribers.delete(endpoint);
+  res.json({ ok: true });
+});
+
+// ─── Push: Background alert checker ───────────────────────────────────
+function normalizeName(name) {
+  return name.toLowerCase().trim().replace(/\s+/g, " ").normalize("NFC");
+}
+
+function matchAlerts(tickList, observations) {
+  if (!tickList?.birds || !observations?.observations) return [];
+
+  const missingByLatin = new Map();
+  for (const bird of tickList.birds) {
+    if (!bird.ticked && !bird.removed && bird.latin) {
+      missingByLatin.set(normalizeName(bird.latin), bird);
+    }
+  }
+
+  const alerts = [];
+  const seen = new Set();
+  for (const obs of observations.observations) {
+    const latinKey = normalizeName(obs.latin);
+    const matchedBird = missingByLatin.get(latinKey);
+    if (matchedBird) {
+      const key = matchedBird.latin + "|" + obs.location;
+      if (!seen.has(key)) {
+        seen.add(key);
+        alerts.push({
+          species: obs.species,
+          latin: obs.latin,
+          location: obs.location,
+          count: obs.count,
+          time: obs.time,
+          rare: obs.rare,
+          scarce: obs.scarce,
+          key,
+        });
+      }
+    }
+  }
+  return alerts;
+}
+
+async function fetchTickListData(userId, listType) {
+  const cacheKey = `tick-${listType}-${userId}`;
+  const cached = getCached(cacheKey, TICK_CACHE_TTL);
+  if (cached) return cached;
+
+  const url = `https://netfugl.dk/ranking/${listType}/${userId}`;
+  const response = await fetch(url);
+  if (!response.ok) return null;
+  const html = await response.text();
+  const $ = cheerio.load(html);
+  const birds = [];
+  $("table.datatable tbody tr").each((i, row) => {
+    const cells = $(row).find("td");
+    if (cells.length < 4) return;
+    const ticked = $(cells[1]).text().trim() === "X";
+    const removed = $(cells[2]).text().trim() === "*";
+    const nameCell = $(cells[3]).text().trim();
+    const latinMatch = nameCell.match(/\(([^)]+)\)/);
+    const latin = latinMatch ? latinMatch[1].trim() : "";
+    const name = nameCell.replace(/\([^)]+\)/, "").trim();
+    if (name) birds.push({ name, latin, ticked, removed });
+  });
+  const data = { birds };
+  setCache(cacheKey, data);
+  return data;
+}
+
+async function fetchObsData() {
+  const cacheKey = "obs-push";
+  const cached = getCached(cacheKey, OBS_CACHE_TTL);
+  if (cached) return cached;
+
+  // Reuse the main observations cache if available
+  const mainCached = getCached("obs-all", OBS_CACHE_TTL);
+  if (mainCached) {
+    setCache(cacheKey, mainCached);
+    return mainCached;
+  }
+
+  // Fetch fresh
+  try {
+    const url = "https://dofbasen.dk/observationer/";
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const buffer = await response.arrayBuffer();
+    const html = iconv.decode(Buffer.from(buffer), "iso-8859-1");
+
+    const speciesPattern =
+      /<a[^>]*class="arter"[^>]*href="[^"]*art=(\d+)[^"]*"[^>]*title="Alle observationer af ([^"]+)"[^>]*><span class="(defaultart|subart|su|seasonart)">([^<]+)<\/span><\/a>\s*\(<i>([^<]+)<\/i>\):/g;
+
+    let match;
+    const speciesBlocks = [];
+    while ((match = speciesPattern.exec(html)) !== null) {
+      speciesBlocks.push({
+        index: match.index,
+        cssClass: match[3],
+        danishName: match[4].trim(),
+        latinName: match[5].trim(),
+      });
+    }
+
+    const observations = [];
+    const seen = new Set();
+    const $full = cheerio.load(html);
+
+    for (let i = 0; i < speciesBlocks.length; i++) {
+      const species = speciesBlocks[i];
+      const startIdx = species.index;
+      const endIdx = i + 1 < speciesBlocks.length ? speciesBlocks[i + 1].index : html.length;
+      const block = html.substring(startIdx, endIdx);
+      const $block = cheerio.load(block);
+
+      $block("table tr").each((_, row) => {
+        const cells = $block(row).find("td");
+        if (cells.length < 10) return;
+
+        const locationLink = $block(row).find("a.lokalitet");
+        const location = locationLink.text().trim();
+        if (!location) return;
+
+        const key = `${species.danishName}-${location}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        const countText = $block(row).find('td[align="right"] a.arter').first().text().trim();
+        const count = parseInt(countText, 10) || 0;
+
+        const clockIcon = $block(row).find('i.fa-clock-o[title]');
+        let time = "";
+        if (clockIcon.length) {
+          time = (clockIcon.first().attr("title") || "")
+            .replace(/Ophold p.{1,2} lokaliteten: /, "");
+        }
+
+        observations.push({
+          species: species.danishName,
+          latin: species.latinName,
+          location, count, time,
+          rare: species.cssClass === "su",
+          scarce: species.cssClass === "subart",
+        });
+      });
+    }
+
+    const data = { observations };
+    setCache(cacheKey, data);
+    return data;
+  } catch (err) {
+    console.error("Push obs fetch error:", err.message);
+    return null;
+  }
+}
+
+async function checkAndNotify() {
+  if (subscribers.size === 0) return;
+
+  console.log(`🔍 Checking alerts for ${subscribers.size} subscriber(s)...`);
+
+  const obs = await fetchObsData();
+  if (!obs) return;
+
+  for (const [subKey, sub] of subscribers.entries()) {
+    try {
+      const tickList = await fetchTickListData(sub.userId, sub.listType);
+      if (!tickList) continue;
+
+      const alerts = matchAlerts(tickList, obs);
+      const currentKeys = new Set(alerts.map((a) => a.key));
+
+      // Find NEW alerts (not seen before by this subscriber)
+      const newAlerts = alerts.filter((a) => !sub.lastAlertKeys.has(a.key));
+
+      if (newAlerts.length > 0) {
+        // Build notification
+        const title = newAlerts.length === 1
+          ? `🐦 ${newAlerts[0].species} spottet!`
+          : `🐦 ${newAlerts.length} manglende arter spottet!`;
+
+        const lines = newAlerts.slice(0, 5).map((a) => {
+          const parts = [a.species];
+          if (a.location) parts.push(`📍 ${a.location}`);
+          if (a.count) parts.push(`${a.count} stk`);
+          return parts.join(" — ");
+        });
+        if (newAlerts.length > 5) lines.push(`...og ${newAlerts.length - 5} mere`);
+
+        const payload = JSON.stringify({
+          title,
+          body: lines.join("\n"),
+          data: { url: "/", alertCount: newAlerts.length },
+        });
+
+        await webpush.sendNotification(sub.subscription, payload);
+        console.log(`📬 Sent push to user ${sub.userId}: ${newAlerts.length} new alert(s)`);
+      }
+
+      // Update last seen alerts
+      sub.lastAlertKeys = currentKeys;
+    } catch (err) {
+      if (err.statusCode === 410 || err.statusCode === 404) {
+        // Subscription expired or invalid — remove it
+        console.log(`🗑️ Removing expired subscription for user ${sub.userId}`);
+        subscribers.delete(subKey);
+      } else {
+        console.error(`Push error for user ${sub.userId}:`, err.message);
+      }
+    }
+  }
+}
+
+// Check every 5 minutes
+const PUSH_CHECK_INTERVAL = 5 * 60 * 1000;
+let pushInterval;
+
 // SPA fallback
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "public", "index.html"));
@@ -398,4 +660,7 @@ app.get("*", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🐦 Bird Ticker proxy running on http://localhost:${PORT}`);
+  // Start background push checker
+  pushInterval = setInterval(checkAndNotify, PUSH_CHECK_INTERVAL);
+  console.log(`📬 Push checker running every ${PUSH_CHECK_INTERVAL / 1000}s`);
 });

@@ -456,6 +456,23 @@ a.bird-list-item:active {
   background: var(--accent-dim);
 }
 
+.btn-push {
+  background: var(--bg-card);
+  color: var(--text-dim);
+  margin-top: 10px;
+  border: 1px solid var(--border);
+}
+
+.btn-push.push-on {
+  background: rgba(102, 187, 106, 0.15);
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.btn-push:active {
+  opacity: 0.7;
+}
+
 .btn-secondary {
   background: var(--bg-card);
   color: var(--text);

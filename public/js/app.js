@@ -13,9 +13,11 @@ const App = {
     const settings = Storage.getSettings();
     if (settings.userId) {
       this.showMainView();
+      this.updatePushButton();
       await this.getUserLocation();
       await this.loadData();
       this.startAutoRefresh();
+      this.resubscribePushIfNeeded();
     } else {
       this.showSettings();
     }
@@ -81,6 +83,11 @@ const App = {
       this.saveSettings();
     });
 
+    // Push notifications toggle
+    document.getElementById("btn-toggle-push").addEventListener("click", () => {
+      this.togglePush();
+    });
+
     // Clear data
     document.getElementById("btn-clear").addEventListener("click", () => {
       if (confirm("Ryd alle gemte data?")) {
@@ -90,6 +97,7 @@ const App = {
         Storage.remove("settings");
         Storage.remove("artIdMap");
         Storage.remove("userLocation");
+        Storage.remove("pushEnabled");
         this.showSettings();
         this.showToast("Data ryddet");
       }
@@ -165,10 +173,12 @@ const App = {
 
     Storage.saveSettings({ userId, listType });
     this.showMainView();
+    this.updatePushButton();
     this.showToast("Indstillinger gemt — henter data...");
     await this.getUserLocation();
     await this.loadData(true);
     this.startAutoRefresh();
+    this.resubscribePushIfNeeded();
   },
 
   // ─── Data Loading ────────────────────────────────────────────
@@ -242,6 +252,106 @@ const App = {
   startAutoRefresh() {
     if (this.refreshInterval) clearInterval(this.refreshInterval);
     this.refreshInterval = setInterval(() => this.loadData(), 5 * 60 * 1000);
+  },
+
+  // ─── Push Notifications ──────────────────────────────────
+  pushSupported() {
+    return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+  },
+
+  async togglePush() {
+    if (!this.pushSupported()) {
+      this.showToast("Push-notifikationer understøttes ikke på denne enhed");
+      return;
+    }
+
+    const pushEnabled = Storage.get("pushEnabled");
+    if (pushEnabled) {
+      await this.unsubscribePush();
+    } else {
+      await this.subscribePush();
+    }
+    this.updatePushButton();
+  },
+
+  async subscribePush() {
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        this.showToast("Notifikationstilladelse afvist");
+        return;
+      }
+
+      const reg = await navigator.serviceWorker.ready;
+      const vapidKey = await Scraper.getVapidKey();
+
+      // Convert VAPID key to Uint8Array
+      const padding = "=".repeat((4 - (vapidKey.length % 4)) % 4);
+      const base64 = (vapidKey + padding).replace(/-/g, "+").replace(/_/g, "/");
+      const raw = atob(base64);
+      const key = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) key[i] = raw.charCodeAt(i);
+
+      const subscription = await reg.pushManager.subscribe({
+        userVisualOnly: true,
+        applicationServerKey: key,
+      });
+
+      const settings = Storage.getSettings();
+      await Scraper.subscribePush(
+        subscription.toJSON(),
+        settings.userId,
+        settings.listType
+      );
+
+      Storage.set("pushEnabled", true);
+      this.showToast("🔔 Push-notifikationer aktiveret");
+    } catch (err) {
+      console.error("Push subscribe error:", err);
+      this.showToast("Kunne ikke aktivere notifikationer: " + err.message);
+    }
+  },
+
+  async unsubscribePush() {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const subscription = await reg.pushManager.getSubscription();
+      if (subscription) {
+        await Scraper.unsubscribePush(subscription.endpoint);
+        await subscription.unsubscribe();
+      }
+      Storage.set("pushEnabled", false);
+      this.showToast("🔕 Push-notifikationer deaktiveret");
+    } catch (err) {
+      console.error("Push unsubscribe error:", err);
+      Storage.set("pushEnabled", false);
+    }
+  },
+
+  updatePushButton() {
+    const btn = document.getElementById("btn-toggle-push");
+    const enabled = Storage.get("pushEnabled");
+    btn.textContent = enabled ? "🔔 Notifikationer til" : "🔕 Notifikationer fra";
+    btn.classList.toggle("push-on", !!enabled);
+  },
+
+  // Re-subscribe on settings save (server needs userId)
+  async resubscribePushIfNeeded() {
+    if (!this.pushSupported() || !Storage.get("pushEnabled")) return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const subscription = await reg.pushManager.getSubscription();
+      if (subscription) {
+        const settings = Storage.getSettings();
+        await Scraper.subscribePush(
+          subscription.toJSON(),
+          settings.userId,
+          settings.listType
+        );
+      }
+    } catch (err) {
+      console.warn("Re-subscribe failed:", err);
+    }
   },
 
   // ─── Rendering ───────────────────────────────────────────────
