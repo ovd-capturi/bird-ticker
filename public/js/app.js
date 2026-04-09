@@ -293,7 +293,7 @@ const App = {
       for (let i = 0; i < raw.length; i++) key[i] = raw.charCodeAt(i);
 
       const subscription = await reg.pushManager.subscribe({
-        userVisualOnly: true,
+        userVisibleOnly: true,
         applicationServerKey: key,
       });
 
