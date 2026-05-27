@@ -1,4 +1,4 @@
-const CACHE_NAME = "bird-ticker-v9";
+const CACHE_NAME = "bird-ticker-v10";
 const STATIC_ASSETS = [
   "/",
   "/index.html",

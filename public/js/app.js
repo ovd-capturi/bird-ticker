@@ -511,8 +511,11 @@ const App = {
       }
     }
 
-    document.getElementById("stat-ticked").textContent = tickList.ticked;
-    document.getElementById("stat-total").textContent = tickList.total;
+    const birds = Array.isArray(tickList.birds) ? tickList.birds : [];
+    const totalCount = birds.length || tickList.total || 0;
+    const tickedCount = birds.filter((b) => b.ticked).length || tickList.ticked || 0;
+    document.getElementById("stat-ticked").textContent = tickedCount;
+    document.getElementById("stat-total").textContent = totalCount;
     document.getElementById("stat-missing-alm").textContent = missingAlm.size;
     document.getElementById("stat-missing-su").textContent = missingSU.size;
     document.getElementById("stat-alerts").textContent = matched.size;
