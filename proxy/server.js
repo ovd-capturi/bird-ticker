@@ -752,14 +752,13 @@ app.get("/api/ai-predictions", async (req, res) => {
 const CAL_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h — monthly view changes slowly
 
 function lastYearMonthSampleDates(monthStr) {
-  // monthStr = "YYYY-MM" (target future month). Sample dates = same month, prev year, every 3rd day.
   const m = /^(\d{4})-(\d{2})$/.exec(monthStr);
   if (!m) return [];
   const year = parseInt(m[1], 10) - 1;
   const month = parseInt(m[2], 10);
   const daysInMonth = new Date(year, month, 0).getDate();
   const out = [];
-  for (let d = 1; d <= daysInMonth; d += 3) {
+  for (let d = 1; d <= daysInMonth; d += 5) {
     out.push(`${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
   }
   return out;
@@ -812,7 +811,7 @@ app.get("/api/ai-calendar", async (req, res) => {
       return out;
     }
 
-    const days = await mapLimit(sampleDates, 3, fetchObservationsForDate);
+    const days = await mapLimit(sampleDates, 5, fetchObservationsForDate);
 
     const relevant = [];
     for (const day of days) {
@@ -845,7 +844,7 @@ app.get("/api/ai-calendar", async (req, res) => {
     }
     const topSpecies = [...speciesStats.entries()]
       .sort((a, b) => b[1].count - a[1].count || a[1].minDist - b[1].minDist)
-      .slice(0, 8)
+      .slice(0, 6)
       .map(([latin]) => latin);
 
     if (topSpecies.length === 0) {
@@ -860,7 +859,17 @@ app.get("/api/ai-calendar", async (req, res) => {
     }
 
     const speciesSet = new Set(topSpecies);
-    const trimmed = relevant.filter((o) => speciesSet.has(o.latin));
+    const bySpecies = new Map();
+    for (const o of relevant) {
+      if (!speciesSet.has(o.latin)) continue;
+      if (!bySpecies.has(o.latin)) bySpecies.set(o.latin, []);
+      bySpecies.get(o.latin).push(o);
+    }
+    const trimmed = [];
+    for (const [, list] of bySpecies) {
+      list.sort((a, b) => a.distanceKm - b.distanceKm);
+      trimmed.push(...list.slice(0, 5));
+    }
 
     const monthNamesDa = ["januar","februar","marts","april","maj","juni","juli","august","september","oktober","november","december"];
     const targetMonthName = monthNamesDa[parseInt(month.slice(5,7),10) - 1];
