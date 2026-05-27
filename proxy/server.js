@@ -235,6 +235,7 @@ async function fetchObservationsForDate(date) {
         if (rows.length) {
           const data = { date: effectiveDate, count: rows.length, observations: rows };
           setCache(cacheKey, data);
+          scheduleEmbedding(effectiveDate).catch(() => {});
           return data;
         }
       }

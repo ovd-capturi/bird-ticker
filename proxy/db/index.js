@@ -204,25 +204,28 @@ async function getDatesWithScrape(startDate, endDate) {
 }
 
 async function embedMissingForDate(date, embedFn, pgvectorLiteral) {
-  const { rows } = await query(
-    `SELECT id, species, latin, location, behaviour
-       FROM observations
-      WHERE obs_date = $1 AND embedding IS NULL
-      LIMIT 200`,
-    [date]
-  );
-  if (!rows.length) return 0;
-  const texts = rows.map((r) =>
-    [r.species, r.latin, r.location || "", r.behaviour || ""].filter(Boolean).join(" | ")
-  );
-  const vecs = await embedFn(texts);
-  for (let i = 0; i < rows.length; i++) {
-    await query(
-      `UPDATE observations SET embedding = $1::vector WHERE id = $2`,
-      [pgvectorLiteral(vecs[i]), rows[i].id]
+  let total = 0;
+  while (true) {
+    const { rows } = await query(
+      `SELECT id, species, latin, location, behaviour
+         FROM observations
+        WHERE obs_date = $1 AND embedding IS NULL
+        LIMIT 200`,
+      [date]
     );
+    if (!rows.length) return total;
+    const texts = rows.map((r) =>
+      [r.species, r.latin, r.location || "", r.behaviour || ""].filter(Boolean).join(" | ")
+    );
+    const vecs = await embedFn(texts);
+    for (let i = 0; i < rows.length; i++) {
+      await query(
+        `UPDATE observations SET embedding = $1::vector WHERE id = $2`,
+        [pgvectorLiteral(vecs[i]), rows[i].id]
+      );
+    }
+    total += rows.length;
   }
-  return rows.length;
 }
 
 async function getScrapeAge(date) {
