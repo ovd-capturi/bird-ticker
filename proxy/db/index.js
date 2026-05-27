@@ -151,28 +151,18 @@ async function getObservationsByDate(date) {
   }));
 }
 
-async function getRelevantObsForMonth({ year, month, latinList, lat, lng, radiusKm }) {
+async function getRelevantObsForMonth({ year, month, latinList }) {
   if (!latinList?.length) return [];
   const start = `${year}-${String(month).padStart(2, "0")}-01`;
   const end = new Date(year, month, 0).toISOString().slice(0, 10);
-  const radiusDegLat = radiusKm / 111;
-  const radiusDegLng = radiusKm / (111 * Math.cos((lat * Math.PI) / 180));
   const { rows } = await query(
     `SELECT to_char(obs_date, 'YYYY-MM-DD') AS obs_date,
             species, latin, location, loknr, lat, lng, count,
             behaviour, raw
        FROM observations
       WHERE obs_date BETWEEN $1 AND $2
-        AND lower(latin) = ANY($3)
-        AND lat IS NOT NULL AND lng IS NOT NULL
-        AND lat BETWEEN $4 AND $5
-        AND lng BETWEEN $6 AND $7`,
-    [
-      start, end,
-      latinList.map((s) => s.toLowerCase()),
-      lat - radiusDegLat, lat + radiusDegLat,
-      lng - radiusDegLng, lng + radiusDegLng,
-    ]
+        AND lower(latin) = ANY($3)`,
+    [start, end, latinList.map((s) => s.toLowerCase())]
   );
   return rows.map((r) => ({
     date: r.obs_date,

@@ -690,14 +690,13 @@ app.get("/api/ai-predictions", async (req, res) => {
           if (!obs.latin) continue;
           if (!missing.has(obs.latin.toLowerCase())) continue;
           const dist = distanceKm(lat, lng, obs.lat, obs.lng);
-          if (dist == null || dist > 100) continue;
           out.push({
             species: obs.species,
             latin: obs.latin,
             date: day.date,
             location: obs.location,
             count: obs.count,
-            distanceKm: Math.round(dist * 10) / 10,
+            distanceKm: dist == null ? null : Math.round(dist * 10) / 10,
             time: obs.time,
             rare: obs.rare,
           });
@@ -709,16 +708,14 @@ app.get("/api/ai-predictions", async (req, res) => {
     const recentRelevant = filterRelevant(recent);
     const lastYearRelevant = filterRelevant(lastYear);
 
-    // Top 10 species by recent obs count (tiebreak: closer distance)
     const speciesStats = new Map();
     for (const obs of recentRelevant) {
-      const cur = speciesStats.get(obs.latin) || { count: 0, minDist: Infinity };
+      const cur = speciesStats.get(obs.latin) || { count: 0 };
       cur.count += 1;
-      cur.minDist = Math.min(cur.minDist, obs.distanceKm);
       speciesStats.set(obs.latin, cur);
     }
     const topSpecies = [...speciesStats.entries()]
-      .sort((a, b) => b[1].count - a[1].count || a[1].minDist - b[1].minDist)
+      .sort((a, b) => b[1].count - a[1].count)
       .slice(0, 10)
       .map(([latin]) => latin);
 
@@ -726,7 +723,7 @@ app.get("/api/ai-predictions", async (req, res) => {
       const empty = {
         generatedAt: new Date().toISOString(),
         predictions: [],
-        note: "Ingen relevante observationer indenfor 100 km",
+        note: "Ingen relevante observationer for manglende arter",
       };
       setCache(cacheKey, empty);
       return res.json(empty);
@@ -736,7 +733,7 @@ app.get("/api/ai-predictions", async (req, res) => {
     const trim = (list) => list.filter((o) => speciesSet.has(o.latin));
 
     const systemPrompt =
-      "Du er en ekspert ornitolog og analytiker. Brugeren mangler at krydse en række fuglearter af. Givet observationsdata fra brugerens område (de seneste 7 dage og samme uge sidste år), forudsig hvor og hvornår brugeren har bedst chance for at se de manglende arter de næste dage. Brug mønstre fra historikken. Svar kun med struktureret JSON, på dansk.";
+      "Du er en ekspert ornitolog og analytiker. Brugeren mangler at krydse en række fuglearter af. Givet observationsdata fra hele Danmark (de seneste 7 dage og samme uge sidste år), forudsig hvor og hvornår brugeren har bedst chance for at se de manglende arter de næste dage. Brug mønstre fra historikken. Svar kun med struktureret JSON, på dansk.";
 
     const userPayload = {
       brugerLokation: { lat, lng },
@@ -911,25 +908,16 @@ app.get("/api/ai-calendar", async (req, res) => {
           year: prevYear,
           month: monthNum,
           latinList: [...missing.keys()],
-          lat, lng,
-          radiusKm: 100,
         });
-        relevant = fromDb
-          .map((o) => {
-            const dist = distanceKm(lat, lng, o.lat, o.lng);
-            if (dist == null || dist > 100) return null;
-            return {
-              species: o.species,
-              latin: o.latin,
-              date: o.date,
-              location: o.location,
-              loknr: o.loknr,
-              count: o.count,
-              distanceKm: Math.round(dist * 10) / 10,
-              rare: o.rare,
-            };
-          })
-          .filter(Boolean);
+        relevant = fromDb.map((o) => ({
+          species: o.species,
+          latin: o.latin,
+          date: o.date,
+          location: o.location,
+          loknr: o.loknr,
+          count: o.count,
+          rare: o.rare,
+        }));
       } catch (err) {
         console.error("AI calendar DB path failed, falling back to scrape:", err.message);
       }
@@ -942,8 +930,6 @@ app.get("/api/ai-calendar", async (req, res) => {
         for (const obs of day.observations) {
           if (!obs.latin) continue;
           if (!missing.has(obs.latin.toLowerCase())) continue;
-          const dist = distanceKm(lat, lng, obs.lat, obs.lng);
-          if (dist == null || dist > 100) continue;
           relevant.push({
             species: obs.species,
             latin: obs.latin,
@@ -951,23 +937,20 @@ app.get("/api/ai-calendar", async (req, res) => {
             location: obs.location,
             loknr: obs.loknr,
             count: obs.count,
-            distanceKm: Math.round(dist * 10) / 10,
             rare: obs.rare,
           });
         }
       }
     }
 
-    // Top 8 species by frequency (tiebreak: closer distance)
     const speciesStats = new Map();
     for (const obs of relevant) {
-      const cur = speciesStats.get(obs.latin) || { count: 0, minDist: Infinity };
+      const cur = speciesStats.get(obs.latin) || { count: 0 };
       cur.count += 1;
-      cur.minDist = Math.min(cur.minDist, obs.distanceKm);
       speciesStats.set(obs.latin, cur);
     }
     const topSpecies = [...speciesStats.entries()]
-      .sort((a, b) => b[1].count - a[1].count || a[1].minDist - b[1].minDist)
+      .sort((a, b) => b[1].count - a[1].count)
       .slice(0, 6)
       .map(([latin]) => latin);
 
@@ -976,7 +959,7 @@ app.get("/api/ai-calendar", async (req, res) => {
         generatedAt: new Date().toISOString(),
         month,
         locations: [],
-        note: "Ingen relevante observationer indenfor 100 km for denne måned sidste år",
+        note: "Ingen relevante observationer for manglende arter i denne måned sidste år",
       };
       setCache(cacheKey, empty);
       return res.json(empty);
@@ -991,7 +974,7 @@ app.get("/api/ai-calendar", async (req, res) => {
     }
     const trimmed = [];
     for (const [, list] of bySpecies) {
-      list.sort((a, b) => a.distanceKm - b.distanceKm);
+      list.sort((a, b) => (b.count || 0) - (a.count || 0));
       trimmed.push(...list.slice(0, 5));
     }
 
@@ -1000,7 +983,7 @@ app.get("/api/ai-calendar", async (req, res) => {
 
     const systemPrompt =
       "Du er en ekspert ornitolog. Brugeren planlægger fugleture og mangler at krydse en række arter af. " +
-      "Givet observationer fra samme måned sidste år nær brugerens position, anbefal de bedste lokaliteter at besøge i den kommende måned. " +
+      "Givet observationer fra samme måned sidste år, anbefal de bedste lokaliteter i Danmark at besøge i den kommende måned — afstand er ikke en begrænsning, brugeren planlægger ture. " +
       "Gruppér anbefalinger pr. LOKALITET, ikke pr. art — hvert lokalitets-objekt skal liste de manglende arter brugeren har god chance for at se dér. " +
       "Sortér lokaliteter så dem hvor brugeren kan krydse flest manglende arter af kommer først. " +
       "Brug danske fuglenavne, ikke latinske. " +
@@ -1017,7 +1000,6 @@ app.get("/api/ai-calendar", async (req, res) => {
         location: o.location,
         loknr: o.loknr,
         count: o.count,
-        distanceKm: o.distanceKm,
         rare: o.rare,
       })),
     };
