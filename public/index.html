@@ -68,8 +68,12 @@
         <div class="stat-label">Total</div>
       </div>
       <div class="stat">
-        <div class="stat-value" id="stat-missing" style="color: var(--orange);">—</div>
-        <div class="stat-label">Mangler</div>
+        <div class="stat-value" id="stat-missing-alm" style="color: var(--orange);">—</div>
+        <div class="stat-label">Mangler alm</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="stat-missing-su" style="color: var(--orange);">—</div>
+        <div class="stat-label">Mangler SU</div>
       </div>
       <div class="stat">
         <div class="stat-value alert" id="stat-alerts">—</div>
@@ -81,6 +85,7 @@
     <div class="tabs">
       <button class="tab active" data-view="alerts">🔔 Alarmer</button>
       <button class="tab" data-view="list">📋 Fugle</button>
+      <button class="tab" data-view="ai">🔮 AI</button>
     </div>
 
     <!-- Sort Bar (for alerts view) -->
@@ -105,6 +110,11 @@
 
     <!-- Alerts View -->
     <div id="view-alerts">
+      <div class="date-strip" id="date-strip">
+        <button class="date-arrow" id="date-prev" title="Forrige dag">‹</button>
+        <div class="date-label" id="date-label">I dag</div>
+        <button class="date-arrow" id="date-next" title="Næste dag">›</button>
+      </div>
       <div class="card-list" id="alerts-container">
         <div class="empty-state">
           <div class="emoji">🔭</div>
@@ -116,6 +126,23 @@
     <!-- List View -->
     <div id="view-list" style="display: none;">
       <div id="list-container"></div>
+    </div>
+
+    <!-- AI View -->
+    <div id="view-ai" style="display: none;">
+      <div class="ai-banner" id="ai-banner" style="display:none;">
+        <div class="ai-banner-header">
+          <span class="ai-banner-title">🔮 Forudsigelser</span>
+          <span class="ai-banner-meta" id="ai-banner-meta"></span>
+        </div>
+        <div class="ai-banner-body" id="ai-banner-body"></div>
+      </div>
+      <div class="ai-empty-state" id="ai-empty-state" style="display:none;">
+        <div class="empty-state">
+          <div class="emoji">🔮</div>
+          <p>Henter forudsigelser...</p>
+        </div>
+      </div>
     </div>
 
     <!-- Footer -->

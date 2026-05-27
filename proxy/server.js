@@ -1,4 +1,5 @@
 const express = require("express");
+const compression = require("compression");
 const cheerio = require("cheerio");
 const iconv = require("iconv-lite");
 const webpush = require("web-push");
@@ -17,8 +18,22 @@ webpush.setVapidDetails(
   VAPID_PRIVATE
 );
 
-// Cache stores
+// Cache stores. Bounded LRU-ish: oldest entries evicted past MAX_CACHE_ENTRIES
+// to prevent unbounded heap growth on long-running App Service container.
 const cache = new Map();
+const MAX_CACHE_ENTRIES = 500;
+
+// In-flight request dedupe: parallel callers wait on the same upstream fetch.
+// Without this, two concurrent cold requests both scrape DOFbasen.
+const inflight = new Map();
+function dedupe(key, fn) {
+  if (inflight.has(key)) return inflight.get(key);
+  const p = Promise.resolve()
+    .then(fn)
+    .finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
 
 // Push subscription store: Map<subKey, { subscription, userId, listType, lastAlertKeys }>
 const subscribers = new Map();
@@ -32,14 +47,31 @@ function getCached(key, ttl) {
 }
 
 function setCache(key, data) {
+  if (cache.has(key)) cache.delete(key);
   cache.set(key, { data, time: Date.now() });
+  if (cache.size > MAX_CACHE_ENTRIES) {
+    const firstKey = cache.keys().next().value;
+    cache.delete(firstKey);
+  }
 }
 
 // JSON body parsing for push subscription
 app.use(express.json());
 
-// Serve static frontend files
-app.use(express.static(path.join(__dirname, "..", "public")));
+// Gzip/brotli responses to cut bandwidth + perceived latency.
+app.use(compression());
+
+// Serve static frontend files with browser caching. Service worker (sw.js)
+// must NOT be long-cached or PWA updates stall.
+app.use(express.static(path.join(__dirname, "..", "public"), {
+  maxAge: "1d",
+  etag: true,
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith("sw.js") || filePath.endsWith("manifest.json")) {
+      res.setHeader("Cache-Control", "no-cache");
+    }
+  },
+}));
 
 // CORS for local dev
 app.use((req, res, next) => {
@@ -60,10 +92,48 @@ app.get("/api/ticklist", async (req, res) => {
   try {
     const url = `https://netfugl.dk/ranking/${listType}/${userId}`;
     const response = await fetch(url);
-    if (!response.ok) throw new Error(`Netfugl returned ${response.status}`);
+
+    // Check if user not found (even before checking status)
+    if (response.status !== 200) {
+      console.log(`Netfugl returned ${response.status} for user ${userId}`);
+      // Try to get HTML to see if it's the not found page
+      const html = await response.text();
+      const $ = cheerio.load(html);
+      const noUserMsg = $("p").text().includes("Klik her for at vende tilbage");
+      
+      if (noUserMsg) {
+        return res.json({
+          userId,
+          listType,
+          listName: "Not found",
+          total: 0,
+          ticked: 0,
+          birds: [],
+          error: "User not found on Netfugl"
+         });
+      }
+      
+      throw new Error(`Netfugl returned ${response.status}`);
+    }
 
     const html = await response.text();
     const $ = cheerio.load(html);
+    
+    // Check if user not found (page contains "Klik her for at vende tilbage")
+    const noUserMsg = $("p").text().includes("Klik her for at vende tilbage");
+    if (noUserMsg) {
+      console.log(`User ${userId} not found on Netfugl`);
+      return res.json({
+        userId,
+        listType,
+        listName: "Not found",
+        total: 0,
+        ticked: 0,
+        birds: [],
+        error: "User not found on Netfugl"
+      });
+    }
+  
     const birds = [];
 
     $("table.datatable tbody tr").each((i, row) => {
@@ -71,8 +141,8 @@ app.get("/api/ticklist", async (req, res) => {
       if (cells.length < 4) return;
 
       const number = parseInt($(cells[0]).text().trim(), 10);
-      const ticked = $(cells[1]).text().trim() === "X";
-      const removed = $(cells[2]).text().trim() === "*";
+const ticked = $(cells[1]).text().trim() === "X";
+      const isSU = $(cells[2]).text().trim() === "*";
       const nameCell = $(cells[3]).text().trim();
 
       // Parse "Agerhøne (Perdix perdix)"
@@ -81,12 +151,26 @@ app.get("/api/ticklist", async (req, res) => {
       const name = nameCell.replace(/\([^)]+\)/, "").trim();
 
       if (name) {
-        birds.push({ number, name, latin, ticked, removed });
+        birds.push({ number, name, latin, ticked, isSU });
       }
     });
 
     // Extract list name from page
     const listName = $("p.page-headline").text().trim() || "Krydsliste";
+
+    // Check if no birds found (could be user not found page without the message)
+    if (birds.length === 0) {
+      console.log(`No birds found for user ${userId}`);
+      return res.json({
+        userId,
+        listType,
+        listName: "No data",
+        total: 0,
+        ticked: 0,
+        birds: [],
+        error: "User not found or no data"
+       });
+     }
 
     const data = {
       userId,
@@ -106,32 +190,57 @@ app.get("/api/ticklist", async (req, res) => {
 });
 
 // ─── Observations Endpoint ────────────────────────────────────────────
-app.get("/api/observations", async (req, res) => {
-  const { region = "all" } = req.query;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const todayStr = () => new Date().toISOString().slice(0, 10);
 
-  const cacheKey = `obs-${region}`;
-  const cached = getCached(cacheKey, OBS_CACHE_TTL);
-  if (cached) return res.json(cached);
+async function fetchObservationsForDate(date) {
+  const isToday = !date || date === todayStr();
+  const cacheKey = `obs-all-${date || "today"}`;
+  const ttl = isToday ? OBS_CACHE_TTL : 24 * 60 * 60 * 1000;
+  const cached = getCached(cacheKey, ttl);
+  if (cached) return cached;
 
-  try {
-    const url = "https://dofbasen.dk/observationer/";
-    const response = await fetch(url);
+  return dedupe(cacheKey, async () => {
+    const cachedAfterWait = getCached(cacheKey, ttl);
+    if (cachedAfterWait) return cachedAfterWait;
+
+    let response;
+    if (isToday) {
+      response = await fetch("https://dofbasen.dk/observationer/");
+    } else {
+      const body = new URLSearchParams({ idag: date, summering: "tur" });
+      response = await fetch("https://dofbasen.dk/observationer/index.php", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+      });
+    }
     if (!response.ok) throw new Error(`DOFbasen returned ${response.status}`);
+    return parseObservationsHtml(response, date || todayStr(), cacheKey);
+  });
+}
+
+app.get("/api/observations", async (req, res) => {
+  const date = DATE_RE.test(req.query.date || "") ? req.query.date : null;
+  try {
+    const data = await fetchObservationsForDate(date);
+    res.json(data);
+  } catch (err) {
+    console.error("Observations error:", err.message);
+    res.status(500).json({ error: "Failed to fetch observations", detail: err.message });
+  }
+});
+
+async function parseObservationsHtml(response, dateLabel, cacheKey) {
+  try {
 
     // DOFbasen uses ISO-8859-1
     const buffer = await response.arrayBuffer();
     const html = iconv.decode(Buffer.from(buffer), "iso-8859-1");
-    const $ = cheerio.load(html);
 
     const observations = [];
     const seen = new Set();
 
-    // DOFbasen structure: species name in <a><span class="defaultart|subart|seasonart">
-    // followed by (<i>Latin name</i>): then table rows with observation details
-    const content = $("#content_observation").html() || $("body").html();
-    const $content = cheerio.load(content);
-
-    // Find all species headers and their observation tables
     const fullHtml = html;
 
     // Parse species blocks: each species has an <a> with class "arter" containing span, then tables
@@ -159,8 +268,9 @@ app.get("/api/observations", async (req, res) => {
       const endIdx = i + 1 < speciesBlocks.length ? speciesBlocks[i + 1].index : fullHtml.length;
       const block = fullHtml.substring(startIdx, endIdx);
 
-      // Parse observation tables within this block
-      const $block = cheerio.load(block);
+      // Parse observation tables within this block. Fragment mode (3rd arg
+      // false) skips wrapping in <html>/<body>, cutting per-block memory.
+      const $block = cheerio.load(block, null, false);
       $block("table tr").each((_, row) => {
         const cells = $block(row).find("td");
         if (cells.length < 10) return;
@@ -288,18 +398,18 @@ app.get("/api/observations", async (req, res) => {
     }
 
     const data = {
-      date: new Date().toISOString().slice(0, 10),
+      date: dateLabel,
       count: observations.length,
       observations,
     };
 
     setCache(cacheKey, data);
-    res.json(data);
+    return data;
   } catch (err) {
-    console.error("Observations error:", err.message);
-    res.status(500).json({ error: "Failed to fetch observations", detail: err.message });
+    console.error("Observations parse error:", err.message);
+    throw err;
   }
-});
+}
 
 // ─── Locality Coordinates Endpoint ────────────────────────────────────
 const LOK_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
@@ -408,6 +518,233 @@ app.get("/api/localities", async (req, res) => {
   res.json(results);
 });
 
+// ─── AI Predictions Endpoint ──────────────────────────────────────────
+const AI_CACHE_TTL = 60 * 60 * 1000; // 1h
+const FOUNDRY_ENDPOINT = process.env.AZURE_FOUNDRY_ENDPOINT || "";
+const FOUNDRY_KEY = process.env.AZURE_FOUNDRY_KEY || "";
+const FOUNDRY_DEPLOYMENT = process.env.AZURE_FOUNDRY_DEPLOYMENT || "";
+const FOUNDRY_API_VERSION = process.env.AZURE_FOUNDRY_API_VERSION || "2024-08-01-preview";
+
+function distanceKm(lat1, lng1, lat2, lng2) {
+  if (lat1 == null || lng1 == null || lat2 == null || lng2 == null) return null;
+  const R = 6371;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function dateNDaysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+function dateOneYearAgo(dateStr) {
+  const [y, m, dd] = dateStr.split("-").map(Number);
+  return `${y - 1}-${String(m).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+}
+
+app.get("/api/ai-predictions", async (req, res) => {
+  if (!FOUNDRY_ENDPOINT || !FOUNDRY_KEY || !FOUNDRY_DEPLOYMENT) {
+    return res.status(503).json({ error: "AI not configured. Set AZURE_FOUNDRY_ENDPOINT, AZURE_FOUNDRY_KEY, AZURE_FOUNDRY_DEPLOYMENT." });
+  }
+
+  const userId = req.query.userId;
+  const listType = req.query.listType || "1";
+  const lat = parseFloat(req.query.lat);
+  const lng = parseFloat(req.query.lng);
+  if (!userId || isNaN(lat) || isNaN(lng)) {
+    return res.status(400).json({ error: "userId, lat, lng required" });
+  }
+
+  const cacheKey = `ai-${userId}-${listType}-${Math.round(lat * 10) / 10}-${Math.round(lng * 10) / 10}`;
+  const cached = getCached(cacheKey, AI_CACHE_TTL);
+  if (cached) return res.json(cached);
+
+  try {
+    const tickList = await fetchTickListData(userId, listType);
+    if (!tickList?.birds?.length) {
+      return res.status(404).json({ error: "tickList not found" });
+    }
+
+    const missing = new Map();
+    for (const b of tickList.birds) {
+      if (!b.ticked && b.latin) missing.set(b.latin.toLowerCase(), b);
+    }
+
+    // Reduced from 7 to 3 days. Each day = full DOFbasen scrape + locality
+    // lookups (~9s cold). 7+7 days exceeded Azure's 230s gateway timeout.
+    const dates = [];
+    for (let i = 0; i < 3; i++) dates.push(dateNDaysAgo(i));
+    const yearAgoDates = dates.map(dateOneYearAgo);
+
+    // Limit concurrency to avoid OOM on small App Service plans.
+    // Cheerio parsing of the full DOFbasen HTML is memory-heavy; 14 in parallel
+    // exhausts Node's default heap on B1.
+    async function mapLimit(items, limit, fn) {
+      const out = new Array(items.length);
+      let idx = 0;
+      const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (idx < items.length) {
+          const i = idx++;
+          out[i] = await fn(items[i]).catch(() => null);
+        }
+      });
+      await Promise.all(workers);
+      return out;
+    }
+
+    const recent = await mapLimit(dates, 3, fetchObservationsForDate);
+    const lastYear = await mapLimit(yearAgoDates, 3, fetchObservationsForDate);
+
+    const filterRelevant = (daysList) => {
+      const out = [];
+      for (const day of daysList) {
+        if (!day?.observations) continue;
+        for (const obs of day.observations) {
+          if (!obs.latin) continue;
+          if (!missing.has(obs.latin.toLowerCase())) continue;
+          const dist = distanceKm(lat, lng, obs.lat, obs.lng);
+          if (dist == null || dist > 100) continue;
+          out.push({
+            species: obs.species,
+            latin: obs.latin,
+            date: day.date,
+            location: obs.location,
+            count: obs.count,
+            distanceKm: Math.round(dist * 10) / 10,
+            time: obs.time,
+            rare: obs.rare,
+          });
+        }
+      }
+      return out;
+    };
+
+    const recentRelevant = filterRelevant(recent);
+    const lastYearRelevant = filterRelevant(lastYear);
+
+    // Top 10 species by recent obs count (tiebreak: closer distance)
+    const speciesStats = new Map();
+    for (const obs of recentRelevant) {
+      const cur = speciesStats.get(obs.latin) || { count: 0, minDist: Infinity };
+      cur.count += 1;
+      cur.minDist = Math.min(cur.minDist, obs.distanceKm);
+      speciesStats.set(obs.latin, cur);
+    }
+    const topSpecies = [...speciesStats.entries()]
+      .sort((a, b) => b[1].count - a[1].count || a[1].minDist - b[1].minDist)
+      .slice(0, 10)
+      .map(([latin]) => latin);
+
+    if (topSpecies.length === 0) {
+      const empty = {
+        generatedAt: new Date().toISOString(),
+        predictions: [],
+        note: "Ingen relevante observationer indenfor 100 km",
+      };
+      setCache(cacheKey, empty);
+      return res.json(empty);
+    }
+
+    const speciesSet = new Set(topSpecies);
+    const trim = (list) => list.filter((o) => speciesSet.has(o.latin));
+
+    const systemPrompt =
+      "Du er en ekspert ornitolog og analytiker. Brugeren mangler at krydse en række fuglearter af. Givet observationsdata fra brugerens område (de seneste 7 dage og samme uge sidste år), forudsig hvor og hvornår brugeren har bedst chance for at se de manglende arter de næste dage. Brug mønstre fra historikken. Svar kun med struktureret JSON, på dansk.";
+
+    const userPayload = {
+      brugerLokation: { lat, lng },
+      manglendeArter: topSpecies.map((latin) => ({
+        latin,
+        navn: missing.get(latin.toLowerCase())?.name,
+      })),
+      sidsteUge: trim(recentRelevant),
+      sammeUgeSidsteAar: trim(lastYearRelevant),
+    };
+
+    const responseFormat = {
+      type: "json_schema",
+      json_schema: {
+        name: "Predictions",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            predictions: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  species: { type: "string" },
+                  latin: { type: "string" },
+                  location: { type: "string" },
+                  confidence: { type: "string", enum: ["lav", "mellem", "høj"] },
+                  reasoning: { type: "string" },
+                  suggestedDates: { type: "array", items: { type: "string" } },
+                },
+                required: ["species", "latin", "location", "confidence", "reasoning", "suggestedDates"],
+              },
+            },
+          },
+          required: ["predictions"],
+        },
+      },
+    };
+
+    const endpoint = FOUNDRY_ENDPOINT.replace(/\/$/, "");
+    const isV1 = /\/openai\/v1$/.test(endpoint);
+    const apiUrl = isV1
+      ? `${endpoint}/chat/completions`
+      : `${endpoint}/openai/deployments/${FOUNDRY_DEPLOYMENT}/chat/completions?api-version=${FOUNDRY_API_VERSION}`;
+
+    const requestBody = {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: JSON.stringify(userPayload) },
+      ],
+      response_format: responseFormat,
+      temperature: 0.4,
+    };
+    if (isV1) requestBody.model = FOUNDRY_DEPLOYMENT;
+
+    const aiRes = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": FOUNDRY_KEY,
+        Authorization: `Bearer ${FOUNDRY_KEY}`,
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!aiRes.ok) {
+      const errText = await aiRes.text();
+      throw new Error(`Foundry ${aiRes.status}: ${errText.slice(0, 300)}`);
+    }
+    const aiJson = await aiRes.json();
+    const content = aiJson.choices?.[0]?.message?.content;
+    if (!content) throw new Error("Empty AI response");
+    const parsed = JSON.parse(content);
+
+    const data = {
+      generatedAt: new Date().toISOString(),
+      predictions: parsed.predictions || [],
+    };
+    setCache(cacheKey, data);
+    res.json(data);
+  } catch (err) {
+    console.error("AI predictions error:", err.message);
+    res.status(500).json({ error: "Failed to generate predictions", detail: err.message });
+  }
+});
+
 // ─── Push: VAPID public key endpoint ──────────────────────────────────
 app.get("/api/push/vapid-key", (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC });
@@ -449,7 +786,7 @@ function matchAlerts(tickList, observations) {
 
   const missingByLatin = new Map();
   for (const bird of tickList.birds) {
-    if (!bird.ticked && !bird.removed && bird.latin) {
+    if (!bird.ticked && bird.latin) {
       missingByLatin.set(normalizeName(bird.latin), bird);
     }
   }
@@ -489,18 +826,28 @@ async function fetchTickListData(userId, listType) {
   if (!response.ok) return null;
   const html = await response.text();
   const $ = cheerio.load(html);
+   
+   // Check if user not found
+  if ($("p").text().includes("Klik her for at vende tilbage")) {
+    console.log(`User ${userId} not found for push check`);
+    return { birds: [] };
+   }
+   
   const birds = [];
   $("table.datatable tbody tr").each((i, row) => {
     const cells = $(row).find("td");
     if (cells.length < 4) return;
     const ticked = $(cells[1]).text().trim() === "X";
-    const removed = $(cells[2]).text().trim() === "*";
+    const isSU = $(cells[2]).text().trim() === "*";
     const nameCell = $(cells[3]).text().trim();
     const latinMatch = nameCell.match(/\(([^)]+)\)/);
     const latin = latinMatch ? latinMatch[1].trim() : "";
     const name = nameCell.replace(/\([^)]+\)/, "").trim();
-    if (name) birds.push({ name, latin, ticked, removed });
+    if (name) birds.push({ name, latin, ticked, isSU });
   });
+     // Return null if no birds found
+  if (birds.length === 0) return null;
+     
   const data = { birds };
   setCache(cacheKey, data);
   return data;
@@ -542,14 +889,13 @@ async function fetchObsData() {
 
     const observations = [];
     const seen = new Set();
-    const $full = cheerio.load(html);
 
     for (let i = 0; i < speciesBlocks.length; i++) {
       const species = speciesBlocks[i];
       const startIdx = species.index;
       const endIdx = i + 1 < speciesBlocks.length ? speciesBlocks[i + 1].index : html.length;
       const block = html.substring(startIdx, endIdx);
-      const $block = cheerio.load(block);
+      const $block = cheerio.load(block, null, false);
 
       $block("table tr").each((_, row) => {
         const cells = $block(row).find("td");
@@ -612,27 +958,38 @@ async function checkAndNotify() {
       const newAlerts = alerts.filter((a) => !sub.lastAlertKeys.has(a.key));
 
       if (newAlerts.length > 0) {
-        // Build notification
-        const title = newAlerts.length === 1
-          ? `🐦 ${newAlerts[0].species} spottet!`
-          : `🐦 ${newAlerts.length} manglende arter spottet!`;
+        const speciesGroups = new Map();
+        for (const a of newAlerts) {
+          const key = a.latin || a.species;
+          if (!speciesGroups.has(key)) speciesGroups.set(key, { species: a.species, locations: [], totalCount: 0 });
+          const g = speciesGroups.get(key);
+          if (a.location) g.locations.push(a.location);
+          g.totalCount += a.count || 0;
+        }
+        const speciesCount = speciesGroups.size;
 
-        const lines = newAlerts.slice(0, 5).map((a) => {
-          const parts = [a.species];
-          if (a.location) parts.push(`📍 ${a.location}`);
-          if (a.count) parts.push(`${a.count} stk`);
+        const title = speciesCount === 1
+          ? `🐦 ${[...speciesGroups.values()][0].species} spottet!`
+          : `🐦 ${speciesCount} manglende arter spottet!`;
+
+        const lines = [...speciesGroups.values()].slice(0, 5).map((g) => {
+          const parts = [g.species];
+          const locs = [...new Set(g.locations)];
+          if (locs.length === 1) parts.push(`📍 ${locs[0]}`);
+          else if (locs.length > 1) parts.push(`📍 ${locs.length} lok.`);
+          if (g.totalCount) parts.push(`${g.totalCount} stk`);
           return parts.join(" — ");
         });
-        if (newAlerts.length > 5) lines.push(`...og ${newAlerts.length - 5} mere`);
+        if (speciesCount > 5) lines.push(`...og ${speciesCount - 5} mere`);
 
         const payload = JSON.stringify({
           title,
           body: lines.join("\n"),
-          data: { url: "/", alertCount: newAlerts.length },
+          data: { url: "/", alertCount: speciesCount },
         });
 
         await webpush.sendNotification(sub.subscription, payload);
-        console.log(`📬 Sent push to user ${sub.userId}: ${newAlerts.length} new alert(s)`);
+        console.log(`📬 Sent push to user ${sub.userId}: ${speciesCount} new species (${newAlerts.length} obs)`);
       }
 
       // Update last seen alerts
@@ -653,13 +1010,22 @@ async function checkAndNotify() {
 const PUSH_CHECK_INTERVAL = 5 * 60 * 1000;
 let pushInterval;
 
-// SPA fallback
+// SPA fallback. Read index.html once at boot — avoids disk IO per hit.
+const fs = require("fs");
+const INDEX_HTML = fs.readFileSync(
+  path.join(__dirname, "..", "public", "index.html")
+);
 app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "..", "public", "index.html"));
+  res.type("html").send(INDEX_HTML);
 });
 
 app.listen(PORT, () => {
   console.log(`🐦 Bird Ticker proxy running on http://localhost:${PORT}`);
+  // Pre-warm today's observations cache so the first user doesn't pay the
+  // 9s cold-scrape latency.
+  fetchObservationsForDate(null)
+    .then((d) => console.log(`🔥 Prewarmed observations: ${d.count} obs`))
+    .catch((e) => console.error("Prewarm failed:", e.message));
   // Start background push checker
   pushInterval = setInterval(checkAndNotify, PUSH_CHECK_INTERVAL);
   console.log(`📬 Push checker running every ${PUSH_CHECK_INTERVAL / 1000}s`);

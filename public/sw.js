@@ -1,4 +1,4 @@
-const CACHE_NAME = "bird-ticker-v2";
+const CACHE_NAME = "bird-ticker-v9";
 const STATIC_ASSETS = [
   "/",
   "/index.html",
@@ -27,7 +27,7 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
-// Fetch: network-first for API, cache-first for static
+// Fetch: network-first for API + app shell. Cache fallback only on offline.
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
@@ -37,13 +37,15 @@ self.addEventListener("fetch", (event) => {
   }
 
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      return cached || fetch(event.request).then((response) => {
-        const clone = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+    fetch(event.request)
+      .then((response) => {
+        if (response.ok && event.request.method === "GET") {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        }
         return response;
-      });
-    })
+      })
+      .catch(() => caches.match(event.request))
   );
 });
 

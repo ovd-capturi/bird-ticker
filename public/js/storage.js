@@ -42,14 +42,44 @@ const Storage = {
     this.set("ticklist", data);
   },
 
-  // Last observations
-  getObservations() {
-    return this.get("observations");
+  // Observations — keyed by date (YYYY-MM-DD), capped at 7 entries (LRU by access).
+  _OBS_MAX_DAYS: 7,
+
+  getObservationsMap() {
+    return this.get("observationsByDate2") || {};
   },
 
-  saveObservations(data) {
+  getObservations(date) {
+    const map = this.getObservationsMap();
+    const key = date || "_today";
+    const entry = map[key];
+    return entry ? entry.data : null;
+  },
+
+  saveObservations(data, date) {
+    const map = this.getObservationsMap();
+    const key = date || "_today";
     data._savedAt = Date.now();
-    this.set("observations", data);
+    map[key] = { data, accessedAt: Date.now() };
+
+    // Prune to last N by accessedAt
+    const keys = Object.keys(map);
+    if (keys.length > this._OBS_MAX_DAYS) {
+      keys.sort((a, b) => map[a].accessedAt - map[b].accessedAt);
+      while (keys.length > this._OBS_MAX_DAYS) {
+        delete map[keys.shift()];
+      }
+    }
+    this.set("observationsByDate2", map);
+  },
+
+  touchObservations(date) {
+    const map = this.getObservationsMap();
+    const key = date || "_today";
+    if (map[key]) {
+      map[key].accessedAt = Date.now();
+      this.set("observationsByDate2", map);
+    }
   },
 
   // Alerts (matched missing birds)
@@ -59,5 +89,14 @@ const Storage = {
 
   saveAlerts(data) {
     this.set("alerts", data);
+  },
+
+  // AI predictions
+  getPredictions() {
+    return this.get("predictions");
+  },
+
+  savePredictions(data) {
+    this.set("predictions", data);
   },
 };
