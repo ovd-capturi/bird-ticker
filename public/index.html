@@ -86,6 +86,7 @@
       <button class="tab active" data-view="alerts">🔔 Alarmer</button>
       <button class="tab" data-view="list">📋 Fugle</button>
       <button class="tab" data-view="ai">🔮 AI</button>
+      <button class="tab" data-view="calendar">📅 Kalender</button>
     </div>
 
     <!-- Sort Bar (for alerts view) -->
@@ -143,6 +144,15 @@
           <p>Henter forudsigelser...</p>
         </div>
       </div>
+    </div>
+
+    <!-- Calendar View -->
+    <div id="view-calendar" style="display: none;">
+      <div class="calendar-header">
+        <div class="calendar-meta" id="calendar-meta"></div>
+        <button class="btn-link" id="btn-calendar-refresh" title="Generér på ny">🔄 Genberegn</button>
+      </div>
+      <div id="calendar-body"></div>
     </div>
 
     <!-- Footer -->

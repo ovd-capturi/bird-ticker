@@ -99,4 +99,13 @@ const Storage = {
   savePredictions(data) {
     this.set("predictions", data);
   },
+
+  // AI calendar (3-month forward view)
+  getCalendar() {
+    return this.get("calendar");
+  },
+
+  saveCalendar(data) {
+    this.set("calendar", data);
+  },
 };

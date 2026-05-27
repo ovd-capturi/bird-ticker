@@ -22,6 +22,16 @@ const Scraper = {
     return res.json();
    },
 
+  async fetchCalendarMonth(userId, listType, lat, lng, month) {
+    const url = `${API_BASE}/api/ai-calendar?userId=${encodeURIComponent(userId)}&listType=${encodeURIComponent(listType)}&lat=${lat}&lng=${lng}&month=${encodeURIComponent(month)}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    return res.json();
+   },
+
   async fetchObservations(region = "all", date = null) {
     let url = `${API_BASE}/api/observations?region=${encodeURIComponent(region)}`;
     if (date) url += `&date=${encodeURIComponent(date)}`;

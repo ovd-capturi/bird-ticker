@@ -104,6 +104,10 @@ const App = {
       this.togglePush();
     });
 
+    document.getElementById("btn-calendar-refresh").addEventListener("click", () => {
+      this.loadCalendar(true);
+    });
+
     document.getElementById("btn-clear").addEventListener("click", () => {
       if (confirm("Ryd alle gemte data?")) {
         Storage.remove("ticklist");
@@ -267,6 +271,106 @@ const App = {
       .join("");
   },
 
+  expectedCalendarMonths() {
+    // 3 months starting from current month
+    const now = new Date();
+    const out = [];
+    for (let i = 0; i < 3; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+    }
+    return out;
+  },
+
+  async loadCalendar(forceRefresh = false) {
+    const settings = Storage.getSettings();
+    const body = document.getElementById("calendar-body");
+    const meta = document.getElementById("calendar-meta");
+    if (!settings.userId || this.userLat == null || this.userLng == null) {
+      body.innerHTML = `<div class="empty-state"><div class="emoji">📍</div><p>Position eller bruger-ID mangler</p></div>`;
+      meta.textContent = "";
+      return;
+    }
+
+    const expected = this.expectedCalendarMonths();
+    const cached = Storage.getCalendar();
+    const cachedMonths = cached?.months?.map((m) => m.month) || [];
+    const stale =
+      !cached ||
+      cachedMonths[0] !== expected[0] ||
+      cachedMonths.length < expected.length;
+
+    if (cached && !stale && !forceRefresh) {
+      this.renderCalendar(cached);
+      return;
+    }
+
+    // Show partial cache while regenerating
+    if (cached) this.renderCalendar(cached);
+
+    meta.textContent = "Genererer…";
+    body.innerHTML = expected
+      .map((m) => `<div class="calendar-month-loading" data-month="${m}">⏳ ${esc(formatMonthLabel(m))}…</div>`)
+      .join("");
+
+    const months = [];
+    for (const month of expected) {
+      try {
+        const monthData = await Scraper.fetchCalendarMonth(
+          settings.userId,
+          settings.listType,
+          this.userLat,
+          this.userLng,
+          month
+        );
+        months.push(monthData);
+        const data = { generatedAt: new Date().toISOString(), months: [...months] };
+        Storage.saveCalendar(data);
+        this.renderCalendar(data, expected);
+      } catch (err) {
+        console.warn(`Calendar ${month} failed:`, err.message);
+        months.push({ month, locations: [], error: err.message });
+        this.renderCalendar({ generatedAt: new Date().toISOString(), months: [...months] }, expected);
+      }
+    }
+  },
+
+  renderCalendar(data, pendingMonths) {
+    const body = document.getElementById("calendar-body");
+    const meta = document.getElementById("calendar-meta");
+
+    if (!data?.months?.length) {
+      body.innerHTML = `<div class="empty-state"><div class="emoji">📅</div><p>Ingen data endnu</p></div>`;
+      meta.textContent = "";
+      return;
+    }
+
+    const ageMin = Math.round((Date.now() - new Date(data.generatedAt).getTime()) / 60000);
+    meta.textContent = ageMin <= 1 ? "Lige nu" : ageMin < 60 ? `${ageMin} min siden` : `${Math.round(ageMin / 60)} t siden`;
+
+    // Build set of currently ticked latin names for live overlay
+    const tickList = Storage.getTickList();
+    const tickedLatin = new Set();
+    if (tickList?.birds) {
+      for (const b of tickList.birds) {
+        if (b.ticked && b.latin) tickedLatin.add(b.latin.toLowerCase());
+      }
+    }
+
+    const monthsByKey = new Map(data.months.map((m) => [m.month, m]));
+    const order = pendingMonths && pendingMonths.length ? pendingMonths : data.months.map((m) => m.month);
+
+    body.innerHTML = order
+      .map((monthKey) => {
+        const m = monthsByKey.get(monthKey);
+        if (!m) {
+          return `<section class="calendar-month"><h3 class="calendar-month-title">${esc(formatMonthLabel(monthKey))}</h3><div class="calendar-month-loading">⏳ Genererer…</div></section>`;
+        }
+        return renderCalendarMonth(m, tickedLatin);
+      })
+      .join("");
+  },
+
   showSettings() {
     this.currentView = "settings";
     document.getElementById("main-content").style.display = "none";
@@ -295,12 +399,14 @@ const App = {
     document.getElementById("view-alerts").style.display = view === "alerts" ? "block" : "none";
     document.getElementById("view-list").style.display = view === "list" ? "block" : "none";
     document.getElementById("view-ai").style.display = view === "ai" ? "block" : "none";
+    document.getElementById("view-calendar").style.display = view === "calendar" ? "block" : "none";
     document.getElementById("search-bar").style.display = view === "list" ? "block" : "none";
     document.getElementById("sort-bar").style.display = view === "alerts" ? "flex" : "none";
 
     if (view === "list") this.renderBirdList();
     if (view === "alerts") this.renderAlerts();
     if (view === "ai") this.loadAIPredictions();
+    if (view === "calendar") this.loadCalendar();
   },
 
   async saveSettings() {
@@ -807,6 +913,68 @@ function esc(str) {
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;
+}
+
+const MONTH_NAMES_DA = [
+  "Januar", "Februar", "Marts", "April", "Maj", "Juni",
+  "Juli", "August", "September", "Oktober", "November", "December",
+];
+
+function formatMonthLabel(monthKey) {
+  const m = /^(\d{4})-(\d{2})$/.exec(monthKey);
+  if (!m) return monthKey;
+  return `${MONTH_NAMES_DA[parseInt(m[2], 10) - 1]} ${m[1]}`;
+}
+
+function renderCalendarMonth(monthData, tickedLatin) {
+  const title = formatMonthLabel(monthData.month);
+  let inner = "";
+  if (monthData.error) {
+    inner = `<div class="empty-state"><div class="emoji">⚠️</div><p>Kunne ikke generere: ${esc(monthData.error)}</p></div>`;
+  } else if (monthData.note && (!monthData.locations || !monthData.locations.length)) {
+    inner = `<div class="ai-empty">${esc(monthData.note)}</div>`;
+  } else if (!monthData.locations || !monthData.locations.length) {
+    inner = `<div class="ai-empty">Ingen anbefalinger</div>`;
+  } else {
+    inner = monthData.locations
+      .map((loc) => {
+        const birds = (loc.birds || [])
+          .map((b) => {
+            const ticked = tickedLatin.has((b.latin || "").toLowerCase());
+            const confClass = b.confidence === "høj" ? "high" : b.confidence === "mellem" ? "med" : "low";
+            const latinClean = (b.latin || "").trim();
+            const speciesClean = (b.species || "").trim();
+            const showLatin = latinClean && latinClean.toLowerCase() !== speciesClean.toLowerCase();
+            return `
+              <div class="calendar-bird calendar-bird--${confClass}${ticked ? " bird-ticked" : ""}">
+                <div class="calendar-bird-head">
+                  <div class="calendar-bird-species">
+                    ${ticked ? "✓ " : ""}${esc(speciesClean)}
+                    ${showLatin ? `<span class="calendar-bird-latin">${esc(latinClean)}</span>` : ""}
+                  </div>
+                  <div class="calendar-bird-conf">${esc(b.confidence || "")}</div>
+                </div>
+                <div class="calendar-bird-reason">${esc(b.reasoning || "")}</div>
+              </div>`;
+          })
+          .join("");
+        return `
+          <div class="calendar-location">
+            <div class="calendar-location-head">
+              <div class="calendar-location-name">📍 ${esc(loc.name)}</div>
+              <div class="calendar-location-count">${(loc.birds || []).length} arter</div>
+            </div>
+            ${loc.summary ? `<div class="calendar-location-summary">${esc(loc.summary)}</div>` : ""}
+            <div class="calendar-birds">${birds}</div>
+          </div>`;
+      })
+      .join("");
+  }
+  return `
+    <section class="calendar-month">
+      <h3 class="calendar-month-title">${esc(title)}</h3>
+      ${inner}
+    </section>`;
 }
 
 document.addEventListener("DOMContentLoaded", () => App.init());

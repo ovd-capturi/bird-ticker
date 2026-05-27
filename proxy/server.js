@@ -745,6 +745,233 @@ app.get("/api/ai-predictions", async (req, res) => {
   }
 });
 
+// ─── AI Calendar Endpoint ─────────────────────────────────────────────
+// Returns monthly recommendations grouped by location: where to go in a
+// given upcoming month to tick missing species, based on observations from
+// the same month last year.
+const CAL_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h — monthly view changes slowly
+
+function lastYearMonthSampleDates(monthStr) {
+  // monthStr = "YYYY-MM" (target future month). Sample dates = same month, prev year, every 3rd day.
+  const m = /^(\d{4})-(\d{2})$/.exec(monthStr);
+  if (!m) return [];
+  const year = parseInt(m[1], 10) - 1;
+  const month = parseInt(m[2], 10);
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const out = [];
+  for (let d = 1; d <= daysInMonth; d += 3) {
+    out.push(`${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
+  }
+  return out;
+}
+
+app.get("/api/ai-calendar", async (req, res) => {
+  if (!FOUNDRY_ENDPOINT || !FOUNDRY_KEY || !FOUNDRY_DEPLOYMENT) {
+    return res.status(503).json({ error: "AI not configured. Set AZURE_FOUNDRY_ENDPOINT, AZURE_FOUNDRY_KEY, AZURE_FOUNDRY_DEPLOYMENT." });
+  }
+
+  const userId = req.query.userId;
+  const listType = req.query.listType || "1";
+  const lat = parseFloat(req.query.lat);
+  const lng = parseFloat(req.query.lng);
+  const month = req.query.month;
+  if (!userId || isNaN(lat) || isNaN(lng) || !/^\d{4}-\d{2}$/.test(month || "")) {
+    return res.status(400).json({ error: "userId, lat, lng, month (YYYY-MM) required" });
+  }
+
+  const cacheKey = `ai-cal-${userId}-${listType}-${Math.round(lat * 10) / 10}-${Math.round(lng * 10) / 10}-${month}`;
+  const cached = getCached(cacheKey, CAL_CACHE_TTL);
+  if (cached) return res.json(cached);
+
+  try {
+    const tickList = await fetchTickListData(userId, listType);
+    if (!tickList?.birds?.length) {
+      return res.status(404).json({ error: "tickList not found" });
+    }
+
+    const missing = new Map();
+    for (const b of tickList.birds) {
+      if (!b.ticked && b.latin) missing.set(b.latin.toLowerCase(), b);
+    }
+
+    const sampleDates = lastYearMonthSampleDates(month);
+    if (sampleDates.length === 0) {
+      return res.status(400).json({ error: "invalid month" });
+    }
+
+    async function mapLimit(items, limit, fn) {
+      const out = new Array(items.length);
+      let idx = 0;
+      const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (idx < items.length) {
+          const i = idx++;
+          out[i] = await fn(items[i]).catch(() => null);
+        }
+      });
+      await Promise.all(workers);
+      return out;
+    }
+
+    const days = await mapLimit(sampleDates, 3, fetchObservationsForDate);
+
+    const relevant = [];
+    for (const day of days) {
+      if (!day?.observations) continue;
+      for (const obs of day.observations) {
+        if (!obs.latin) continue;
+        if (!missing.has(obs.latin.toLowerCase())) continue;
+        const dist = distanceKm(lat, lng, obs.lat, obs.lng);
+        if (dist == null || dist > 100) continue;
+        relevant.push({
+          species: obs.species,
+          latin: obs.latin,
+          date: day.date,
+          location: obs.location,
+          loknr: obs.loknr,
+          count: obs.count,
+          distanceKm: Math.round(dist * 10) / 10,
+          rare: obs.rare,
+        });
+      }
+    }
+
+    // Top 8 species by frequency (tiebreak: closer distance)
+    const speciesStats = new Map();
+    for (const obs of relevant) {
+      const cur = speciesStats.get(obs.latin) || { count: 0, minDist: Infinity };
+      cur.count += 1;
+      cur.minDist = Math.min(cur.minDist, obs.distanceKm);
+      speciesStats.set(obs.latin, cur);
+    }
+    const topSpecies = [...speciesStats.entries()]
+      .sort((a, b) => b[1].count - a[1].count || a[1].minDist - b[1].minDist)
+      .slice(0, 8)
+      .map(([latin]) => latin);
+
+    if (topSpecies.length === 0) {
+      const empty = {
+        generatedAt: new Date().toISOString(),
+        month,
+        locations: [],
+        note: "Ingen relevante observationer indenfor 100 km for denne måned sidste år",
+      };
+      setCache(cacheKey, empty);
+      return res.json(empty);
+    }
+
+    const speciesSet = new Set(topSpecies);
+    const trimmed = relevant.filter((o) => speciesSet.has(o.latin));
+
+    const monthNamesDa = ["januar","februar","marts","april","maj","juni","juli","august","september","oktober","november","december"];
+    const targetMonthName = monthNamesDa[parseInt(month.slice(5,7),10) - 1];
+
+    const systemPrompt =
+      "Du er en ekspert ornitolog. Brugeren planlægger fugleture og mangler at krydse en række arter af. " +
+      "Givet observationer fra samme måned sidste år indenfor 100 km af brugerens position, anbefal de bedste lokaliteter at besøge i den kommende måned. " +
+      "Gruppér anbefalinger pr. LOKALITET, ikke pr. art — hvert lokalitets-objekt skal liste de manglende arter brugeren har god chance for at se dér. " +
+      "Sortér lokaliteter så dem hvor brugeren kan krydse flest manglende arter af kommer først. " +
+      "Skriv kort dansk reasoning pr. art og pr. lokalitet. Svar kun med struktureret JSON.";
+
+    const userPayload = {
+      brugerLokation: { lat, lng },
+      maalMaaned: month,
+      maalMaanedNavn: targetMonthName,
+      manglendeArter: topSpecies.map((latin) => ({
+        latin,
+        navn: missing.get(latin.toLowerCase())?.name,
+      })),
+      observationerSammeMaanedSidsteAar: trimmed,
+    };
+
+    const responseFormat = {
+      type: "json_schema",
+      json_schema: {
+        name: "CalendarMonth",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            locations: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  name: { type: "string" },
+                  summary: { type: "string" },
+                  birds: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        species: { type: "string" },
+                        latin: { type: "string" },
+                        confidence: { type: "string", enum: ["lav", "mellem", "høj"] },
+                        reasoning: { type: "string" },
+                      },
+                      required: ["species", "latin", "confidence", "reasoning"],
+                    },
+                  },
+                },
+                required: ["name", "summary", "birds"],
+              },
+            },
+          },
+          required: ["locations"],
+        },
+      },
+    };
+
+    const endpoint = FOUNDRY_ENDPOINT.replace(/\/$/, "");
+    const isV1 = /\/openai\/v1$/.test(endpoint);
+    const apiUrl = isV1
+      ? `${endpoint}/chat/completions`
+      : `${endpoint}/openai/deployments/${FOUNDRY_DEPLOYMENT}/chat/completions?api-version=${FOUNDRY_API_VERSION}`;
+
+    const requestBody = {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: JSON.stringify(userPayload) },
+      ],
+      response_format: responseFormat,
+      temperature: 0.4,
+    };
+    if (isV1) requestBody.model = FOUNDRY_DEPLOYMENT;
+
+    const aiRes = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": FOUNDRY_KEY,
+        Authorization: `Bearer ${FOUNDRY_KEY}`,
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!aiRes.ok) {
+      const errText = await aiRes.text();
+      throw new Error(`Foundry ${aiRes.status}: ${errText.slice(0, 300)}`);
+    }
+    const aiJson = await aiRes.json();
+    const content = aiJson.choices?.[0]?.message?.content;
+    if (!content) throw new Error("Empty AI response");
+    const parsed = JSON.parse(content);
+
+    const data = {
+      generatedAt: new Date().toISOString(),
+      month,
+      locations: parsed.locations || [],
+    };
+    setCache(cacheKey, data);
+    res.json(data);
+  } catch (err) {
+    console.error("AI calendar error:", err.message);
+    res.status(500).json({ error: "Failed to generate calendar", detail: err.message });
+  }
+});
+
 // ─── Push: VAPID public key endpoint ──────────────────────────────────
 app.get("/api/push/vapid-key", (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC });
