@@ -29,6 +29,7 @@ const Storage = {
   },
 
   saveSettings(settings) {
+    settings._savedAt = Date.now();
     this.set("settings", settings);
   },
 
@@ -107,5 +108,59 @@ const Storage = {
 
   saveCalendar(data) {
     this.set("calendar", data);
+  },
+
+  async syncSettingsToServer() {
+    try {
+      const settings = this.getSettings();
+      if (!settings || !settings.userId) return;
+      const loc = this.get("userLocation");
+      const body = {
+        userId: settings.userId,
+        listType: settings.listType,
+        lat: loc ? loc.lat : null,
+        lng: loc ? loc.lng : null,
+        settings,
+      };
+      await fetch("/api/prefs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch {}
+  },
+
+  async loadSettingsFromServer(userId) {
+    if (!userId) return false;
+    try {
+      const res = await fetch("/api/prefs?userId=" + encodeURIComponent(userId));
+      if (res.status !== 200) return false;
+      const remote = await res.json();
+      const remoteTime = remote.updated_at ? new Date(remote.updated_at).getTime() : 0;
+      const localSettings = this.get("settings") || {};
+      const localTime = localSettings._savedAt || 0;
+      if (remoteTime <= localTime) return false;
+
+      let changed = false;
+      const merged = { ...localSettings, ...(remote.settings || {}) };
+      if (remote.user_id) merged.userId = remote.user_id;
+      if (remote.list_type) merged.listType = remote.list_type;
+      merged._savedAt = remoteTime;
+      this.set("settings", merged);
+      changed = true;
+
+      if (remote.location_lat != null && remote.location_lng != null) {
+        const localLoc = this.get("userLocation") || {};
+        this.set("userLocation", {
+          lat: remote.location_lat,
+          lng: remote.location_lng,
+          time: localLoc.time || remoteTime,
+        });
+        changed = true;
+      }
+      return changed;
+    } catch {
+      return false;
+    }
   },
 };

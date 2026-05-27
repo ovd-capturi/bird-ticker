@@ -33,8 +33,10 @@ const App = {
     this.bindEvents();
     this.registerSW();
 
-    const settings = Storage.getSettings();
+    let settings = Storage.getSettings();
     if (settings.userId) {
+      const updated = await Storage.loadSettingsFromServer(settings.userId);
+      if (updated) settings = Storage.getSettings();
       this.showMainView();
       this.updatePushButton();
       this.renderDateStrip();
@@ -65,6 +67,7 @@ const App = {
           this.userLat = pos.coords.latitude;
           this.userLng = pos.coords.longitude;
           Storage.set("userLocation", { lat: this.userLat, lng: this.userLng, time: Date.now() });
+          Storage.syncSettingsToServer();
           resolve();
         },
         (err) => {
@@ -419,6 +422,7 @@ const App = {
     }
 
     Storage.saveSettings({ userId, listType });
+    Storage.syncSettingsToServer();
     this.showMainView();
     this.updatePushButton();
     this.showToast("Indstillinger gemt — henter data...");

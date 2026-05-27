@@ -4,6 +4,9 @@ const cheerio = require("cheerio");
 const iconv = require("iconv-lite");
 const webpush = require("web-push");
 const path = require("path");
+const db = require("./db");
+const { runMigrations } = require("./db/migrate");
+const embeddings = require("./db/embeddings");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -193,12 +196,52 @@ const ticked = $(cells[1]).text().trim() === "X";
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
+const embeddingQueue = new Set();
+let embeddingRunning = false;
+async function scheduleEmbedding(date) {
+  if (!db.isEnabled() || !embeddings.isConfigured()) return;
+  embeddingQueue.add(date);
+  if (embeddingRunning) return;
+  embeddingRunning = true;
+  try {
+    while (embeddingQueue.size) {
+      const next = embeddingQueue.values().next().value;
+      embeddingQueue.delete(next);
+      try {
+        const n = await db.embedMissingForDate(next, embeddings.embedBatch, embeddings.pgvectorLiteral);
+        if (n) console.log(`🧮 embedded ${n} obs for ${next}`);
+      } catch (e) {
+        console.error(`embedding failed for ${next}:`, e.message);
+      }
+    }
+  } finally {
+    embeddingRunning = false;
+  }
+}
+
 async function fetchObservationsForDate(date) {
   const isToday = !date || date === todayStr();
+  const effectiveDate = date || todayStr();
   const cacheKey = `obs-all-${date || "today"}`;
   const ttl = isToday ? OBS_CACHE_TTL : 24 * 60 * 60 * 1000;
   const cached = getCached(cacheKey, ttl);
   if (cached) return cached;
+
+  if (!isToday && db.isEnabled()) {
+    try {
+      const log = await db.getScrapeAge(effectiveDate);
+      if (log) {
+        const rows = await db.getObservationsByDate(effectiveDate);
+        if (rows.length) {
+          const data = { date: effectiveDate, count: rows.length, observations: rows };
+          setCache(cacheKey, data);
+          return data;
+        }
+      }
+    } catch (err) {
+      console.error("DB obs read failed:", err.message);
+    }
+  }
 
   return dedupe(cacheKey, async () => {
     const cachedAfterWait = getCached(cacheKey, ttl);
@@ -216,7 +259,17 @@ async function fetchObservationsForDate(date) {
       });
     }
     if (!response.ok) throw new Error(`DOFbasen returned ${response.status}`);
-    return parseObservationsHtml(response, date || todayStr(), cacheKey);
+    const data = await parseObservationsHtml(response, effectiveDate, cacheKey);
+
+    if (db.isEnabled() && data?.observations?.length) {
+      db.upsertObservations(effectiveDate, data.observations)
+        .then((n) => {
+          if (n) console.log(`💾 stored ${n} new obs for ${effectiveDate}`);
+          return scheduleEmbedding(effectiveDate);
+        })
+        .catch((e) => console.error("DB obs upsert failed:", e.message));
+    }
+    return data;
   });
 }
 
@@ -813,26 +866,67 @@ app.get("/api/ai-calendar", async (req, res) => {
       return out;
     }
 
-    const days = await mapLimit(sampleDates, 5, fetchObservationsForDate);
+    let relevant = [];
 
-    const relevant = [];
-    for (const day of days) {
-      if (!day?.observations) continue;
-      for (const obs of day.observations) {
-        if (!obs.latin) continue;
-        if (!missing.has(obs.latin.toLowerCase())) continue;
-        const dist = distanceKm(lat, lng, obs.lat, obs.lng);
-        if (dist == null || dist > 100) continue;
-        relevant.push({
-          species: obs.species,
-          latin: obs.latin,
-          date: day.date,
-          location: obs.location,
-          loknr: obs.loknr,
-          count: obs.count,
-          distanceKm: Math.round(dist * 10) / 10,
-          rare: obs.rare,
+    if (db.isEnabled()) {
+      try {
+        const prevYear = parseInt(month.slice(0, 4), 10) - 1;
+        const monthNum = parseInt(month.slice(5, 7), 10);
+        const haveScrapes = await db.getDatesWithScrape(
+          sampleDates[0], sampleDates[sampleDates.length - 1]
+        );
+        const missingDates = sampleDates.filter((d) => !haveScrapes.has(d));
+        if (missingDates.length) {
+          await mapLimit(missingDates, 5, fetchObservationsForDate);
+        }
+        const fromDb = await db.getRelevantObsForMonth({
+          year: prevYear,
+          month: monthNum,
+          latinList: [...missing.keys()],
+          lat, lng,
+          radiusKm: 100,
         });
+        relevant = fromDb
+          .map((o) => {
+            const dist = distanceKm(lat, lng, o.lat, o.lng);
+            if (dist == null || dist > 100) return null;
+            return {
+              species: o.species,
+              latin: o.latin,
+              date: o.date,
+              location: o.location,
+              loknr: o.loknr,
+              count: o.count,
+              distanceKm: Math.round(dist * 10) / 10,
+              rare: o.rare,
+            };
+          })
+          .filter(Boolean);
+      } catch (err) {
+        console.error("AI calendar DB path failed, falling back to scrape:", err.message);
+      }
+    }
+
+    if (relevant.length === 0) {
+      const days = await mapLimit(sampleDates, 5, fetchObservationsForDate);
+      for (const day of days) {
+        if (!day?.observations) continue;
+        for (const obs of day.observations) {
+          if (!obs.latin) continue;
+          if (!missing.has(obs.latin.toLowerCase())) continue;
+          const dist = distanceKm(lat, lng, obs.lat, obs.lng);
+          if (dist == null || dist > 100) continue;
+          relevant.push({
+            species: obs.species,
+            latin: obs.latin,
+            date: day.date,
+            location: obs.location,
+            loknr: obs.loknr,
+            count: obs.count,
+            distanceKm: Math.round(dist * 10) / 10,
+            rare: obs.rare,
+          });
+        }
       }
     }
 
@@ -1002,29 +1096,77 @@ app.get("/api/push/vapid-key", (req, res) => {
 });
 
 // ─── Push: Subscribe ──────────────────────────────────────────────────
-app.post("/api/push/subscribe", (req, res) => {
+app.post("/api/push/subscribe", async (req, res) => {
   const { subscription, userId, listType } = req.body;
   if (!subscription || !userId) {
     return res.status(400).json({ error: "subscription and userId required" });
   }
 
   const subKey = subscription.endpoint;
+  const existing = subscribers.get(subKey);
   subscribers.set(subKey, {
     subscription,
     userId,
     listType: listType || "1",
-    lastAlertKeys: new Set(),
+    lastAlertKeys: existing?.lastAlertKeys || new Set(),
   });
+
+  if (db.isEnabled()) {
+    try {
+      await db.upsertPushSubscription({
+        endpoint: subKey,
+        userId,
+        listType: listType || "1",
+        subscription,
+      });
+    } catch (err) {
+      console.error("Push subscribe DB write failed:", err.message);
+    }
+  }
 
   console.log(`📬 Push subscription added for user ${userId} (${subscribers.size} total)`);
   res.json({ ok: true });
 });
 
 // ─── Push: Unsubscribe ────────────────────────────────────────────────
-app.post("/api/push/unsubscribe", (req, res) => {
+app.post("/api/push/unsubscribe", async (req, res) => {
   const { endpoint } = req.body;
-  if (endpoint) subscribers.delete(endpoint);
+  if (endpoint) {
+    subscribers.delete(endpoint);
+    if (db.isEnabled()) {
+      try { await db.deletePushSubscription(endpoint); }
+      catch (err) { console.error("Push unsubscribe DB delete failed:", err.message); }
+    }
+  }
   res.json({ ok: true });
+});
+
+// ─── Prefs: load/save user settings (cross-device) ────────────────────
+app.get("/api/prefs", async (req, res) => {
+  const userId = String(req.query.userId || "").trim();
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (!db.isEnabled()) return res.status(404).json({ error: "prefs unavailable" });
+  try {
+    const row = await db.getUserPrefs(userId);
+    if (!row) return res.status(404).json({ error: "no prefs for user" });
+    res.json(row);
+  } catch (err) {
+    console.error("Prefs GET error:", err.message);
+    res.status(500).json({ error: "Failed to read prefs", detail: err.message });
+  }
+});
+
+app.post("/api/prefs", async (req, res) => {
+  const { userId, listType, lat, lng, settings } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (!db.isEnabled()) return res.json({ ok: false, reason: "db disabled" });
+  try {
+    await db.upsertUserPrefs({ userId, listType, lat, lng, settings });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Prefs POST error:", err.message);
+    res.status(500).json({ error: "Failed to save prefs", detail: err.message });
+  }
 });
 
 // ─── Push: Background alert checker ───────────────────────────────────
@@ -1245,11 +1387,19 @@ async function checkAndNotify() {
 
       // Update last seen alerts
       sub.lastAlertKeys = currentKeys;
+      if (db.isEnabled()) {
+        try { await db.updateLastAlertKeys(subKey, currentKeys); }
+        catch (e) { console.error("lastAlertKeys persist failed:", e.message); }
+      }
     } catch (err) {
       if (err.statusCode === 410 || err.statusCode === 404) {
         // Subscription expired or invalid — remove it
         console.log(`🗑️ Removing expired subscription for user ${sub.userId}`);
         subscribers.delete(subKey);
+        if (db.isEnabled()) {
+          try { await db.deletePushSubscription(subKey); }
+          catch (e) { console.error("expired sub DB delete failed:", e.message); }
+        }
       } else {
         console.error(`Push error for user ${sub.userId}:`, err.message);
       }
@@ -1270,14 +1420,35 @@ app.get("*", (req, res) => {
   res.type("html").send(INDEX_HTML);
 });
 
-app.listen(PORT, () => {
-  console.log(`🐦 Bird Ticker proxy running on http://localhost:${PORT}`);
-  // Pre-warm today's observations cache so the first user doesn't pay the
-  // 9s cold-scrape latency.
-  fetchObservationsForDate(null)
-    .then((d) => console.log(`🔥 Prewarmed observations: ${d.count} obs`))
-    .catch((e) => console.error("Prewarm failed:", e.message));
-  // Start background push checker
-  pushInterval = setInterval(checkAndNotify, PUSH_CHECK_INTERVAL);
-  console.log(`📬 Push checker running every ${PUSH_CHECK_INTERVAL / 1000}s`);
-});
+async function bootstrap() {
+  if (db.isEnabled()) {
+    try {
+      await runMigrations();
+      const persisted = await db.loadAllPushSubscriptions();
+      for (const p of persisted) {
+        subscribers.set(p.endpoint, {
+          subscription: p.subscription,
+          userId: p.userId,
+          listType: p.listType,
+          lastAlertKeys: p.lastAlertKeys,
+        });
+      }
+      console.log(`💾 Loaded ${persisted.length} push subscription(s) from DB`);
+    } catch (err) {
+      console.error("DB bootstrap failed (continuing in memory-only mode):", err.message);
+    }
+  } else {
+    console.log("⚠️  DATABASE_URL not set — running without persistence");
+  }
+
+  app.listen(PORT, () => {
+    console.log(`🐦 Bird Ticker proxy running on http://localhost:${PORT}`);
+    fetchObservationsForDate(null)
+      .then((d) => console.log(`🔥 Prewarmed observations: ${d.count} obs`))
+      .catch((e) => console.error("Prewarm failed:", e.message));
+    pushInterval = setInterval(checkAndNotify, PUSH_CHECK_INTERVAL);
+    console.log(`📬 Push checker running every ${PUSH_CHECK_INTERVAL / 1000}s`);
+  });
+}
+
+bootstrap();

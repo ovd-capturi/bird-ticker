@@ -29,6 +29,12 @@ curl http://localhost:3000/api/observations
 curl http://localhost:3000/api/push/vapid-key
 ```
 
+For a local Postgres with pgvector, use the bundled `docker-compose.yml`:
+```bash
+podman compose up -d
+```
+The local image ships pgvector but not `azure_ai`; the app detects this and falls back to a Node-side embedding helper, so no code changes are needed.
+
 ### 2. Build Deployment Package
 ```bash
 cd /Users/ole/private/bird-app
@@ -77,6 +83,93 @@ curl -I https://bird-ticker-dk.azurewebsites.net/
 curl https://bird-ticker-dk.azurewebsites.net/api/ticklist?userId=5653&listType=1
 ```
 
+## Database (Postgres + pgvector)
+
+Azure Database for PostgreSQL Flexible Server hosts the app's relational data and vector embeddings. The server lives in the same region as the App Service to keep latency low and egress free.
+
+### 1. Provision the Server
+Generate a strong admin password first and store it in Azure Key Vault or as an App Service setting; do not commit it. Then:
+
+```bash
+az postgres flexible-server create \
+  --resource-group bird-ticker-rg \
+  --name bird-ticker-pg \
+  --location westeurope \
+  --tier Burstable \
+  --sku-name Standard_B1ms \
+  --storage-size 32 \
+  --version 16 \
+  --admin-user birdapp \
+  --admin-password "<generate>" \
+  --public-access 0.0.0.0 \
+  --database-name birdapp
+```
+
+Notes:
+- `--public-access 0.0.0.0` enables the "Allow Azure services" firewall entry; explicit client IPs are added as separate rules below.
+- Keep the generated password in Key Vault or in `az webapp config appsettings` (see step 5). Avoid plain-text storage.
+
+### 2. Enable Required Extensions
+`vector` and `azure_ai` must be allow-listed via the `azure.extensions` server parameter before `CREATE EXTENSION` will succeed:
+
+```bash
+az postgres flexible-server parameter set \
+  --resource-group bird-ticker-rg \
+  --server-name bird-ticker-pg \
+  --name azure.extensions \
+  --value vector,azure_ai
+```
+
+### 3. Configure azure_ai for Azure OpenAI / Foundry
+These parameters let `azure_openai.create_embeddings()` call your Foundry deployment from inside Postgres:
+
+```bash
+az postgres flexible-server parameter set \
+  --resource-group bird-ticker-rg \
+  --server-name bird-ticker-pg \
+  --name azure_ai.openai_endpoint --value "<AZURE_OPENAI_ENDPOINT>"
+
+az postgres flexible-server parameter set \
+  --resource-group bird-ticker-rg \
+  --server-name bird-ticker-pg \
+  --name azure_ai.openai_subscription_key --value "<AZURE_OPENAI_KEY>"
+```
+
+### 4. Firewall Rules
+Allow Azure-hosted services (covers the App Service outbound IPs). Add additional rules for any developer IPs that need direct access:
+
+```bash
+az postgres flexible-server firewall-rule create \
+  --resource-group bird-ticker-rg \
+  --name bird-ticker-pg \
+  --rule-name allow-azure --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0
+```
+
+### 5. Wire the Connection String into App Service
+```bash
+az webapp config appsettings set \
+  --resource-group bird-ticker-rg \
+  --name bird-ticker-dk \
+  --settings DATABASE_URL="postgresql://birdapp:<password>@bird-ticker-pg.postgres.database.azure.com:5432/birdapp?sslmode=require"
+```
+
+### 6. Migrations
+The app applies migrations on boot from `proxy/db/migrations/*.sql` in lexical order. `002_azure_ai.sql` runs `CREATE EXTENSION azure_ai`; that statement only succeeds on Azure Flexible Server (with the parameter from step 2) and is auto-skipped when running locally.
+
+### 7. Verify
+Connect and list installed extensions to confirm both are present:
+
+```bash
+az postgres flexible-server execute \
+  --name bird-ticker-pg \
+  --admin-user birdapp \
+  --admin-password "<password>" \
+  --database-name birdapp \
+  --querytext "SELECT extname FROM pg_extension;"
+```
+
+Expected rows include `vector` and `azure_ai` alongside the defaults.
+
 ## Configuration
 
 ### App Settings (Azure Portal)
@@ -89,6 +182,10 @@ curl https://bird-ticker-dk.azurewebsites.net/api/ticklist?userId=5653&listType=
 VAPID_PUBLIC=your_public_key
 VAPID_PRIVATE=your_private_key
 PORT=3000
+DATABASE_URL=postgresql://birdapp:...@bird-ticker-pg.postgres.database.azure.com:5432/birdapp?sslmode=require
+AZURE_OPENAI_ENDPOINT=...
+AZURE_OPENAI_KEY=...
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
 ```
 
 ### Startup Command

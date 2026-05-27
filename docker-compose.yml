@@ -1,0 +1,17 @@
+# Local dev stack — run with: podman compose up -d
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: bird-ticker-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: birdapp
+    ports:
+      - "5432:5432"
+    volumes:
+      - bird_pgdata:/var/lib/postgresql/data
+
+volumes:
+  bird_pgdata:
