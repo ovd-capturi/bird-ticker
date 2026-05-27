@@ -12,7 +12,7 @@ A Progressive Web App that cross-references your **Netfugl.dk tick list** (kryds
 - **Example**: `https://netfugl.dk/ranking/1/4468` (Danske Arter for user 4468)
 - **Format**: HTML table with columns: `#`, `X`, `*`, `Navn`, `Dato`, `Lokation`, `Kort`
 - **Key data**: Birds with `X` in column 2 = ticked/seen. Empty = **missing bird** (target!)
-- `*` column marks birds no longer on the Danish list
+- `*` column marks rare birds that should still be included
 - Bird names are Danish + Latin in parentheses
 
 ### 2. DOFbasen.dk Observations
