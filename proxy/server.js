@@ -789,7 +789,9 @@ app.get("/api/ai-calendar", async (req, res) => {
     }
 
     const missing = new Map();
+    const nameToLatin = new Map();
     for (const b of tickList.birds) {
+      if (b.latin && b.name) nameToLatin.set(b.name.toLowerCase(), b.latin);
       if (!b.ticked && b.latin) missing.set(b.latin.toLowerCase(), b);
     }
 
@@ -876,20 +878,26 @@ app.get("/api/ai-calendar", async (req, res) => {
 
     const systemPrompt =
       "Du er en ekspert ornitolog. Brugeren planlægger fugleture og mangler at krydse en række arter af. " +
-      "Givet observationer fra samme måned sidste år indenfor 100 km af brugerens position, anbefal de bedste lokaliteter at besøge i den kommende måned. " +
+      "Givet observationer fra samme måned sidste år nær brugerens position, anbefal de bedste lokaliteter at besøge i den kommende måned. " +
       "Gruppér anbefalinger pr. LOKALITET, ikke pr. art — hvert lokalitets-objekt skal liste de manglende arter brugeren har god chance for at se dér. " +
       "Sortér lokaliteter så dem hvor brugeren kan krydse flest manglende arter af kommer først. " +
+      "Brug danske fuglenavne, ikke latinske. " +
       "Skriv kort dansk reasoning pr. art og pr. lokalitet. Svar kun med struktureret JSON.";
 
     const userPayload = {
       brugerLokation: { lat, lng },
       maalMaaned: month,
       maalMaanedNavn: targetMonthName,
-      manglendeArter: topSpecies.map((latin) => ({
-        latin,
-        navn: missing.get(latin.toLowerCase())?.name,
+      manglendeArter: topSpecies.map((latin) => missing.get(latin.toLowerCase())?.name).filter(Boolean),
+      observationerSammeMaanedSidsteAar: trimmed.map((o) => ({
+        art: o.species,
+        date: o.date,
+        location: o.location,
+        loknr: o.loknr,
+        count: o.count,
+        distanceKm: o.distanceKm,
+        rare: o.rare,
       })),
-      observationerSammeMaanedSidsteAar: trimmed,
     };
 
     const responseFormat = {
@@ -916,11 +924,10 @@ app.get("/api/ai-calendar", async (req, res) => {
                       additionalProperties: false,
                       properties: {
                         species: { type: "string" },
-                        latin: { type: "string" },
                         confidence: { type: "string", enum: ["lav", "mellem", "høj"] },
                         reasoning: { type: "string" },
                       },
-                      required: ["species", "latin", "confidence", "reasoning"],
+                      required: ["species", "confidence", "reasoning"],
                     },
                   },
                 },
@@ -968,10 +975,18 @@ app.get("/api/ai-calendar", async (req, res) => {
     if (!content) throw new Error("Empty AI response");
     const parsed = JSON.parse(content);
 
+    const locations = (parsed.locations || []).map((loc) => ({
+      ...loc,
+      birds: (loc.birds || []).map((b) => ({
+        ...b,
+        latin: nameToLatin.get((b.species || "").toLowerCase()) || "",
+      })),
+    }));
+
     const data = {
       generatedAt: new Date().toISOString(),
       month,
-      locations: parsed.locations || [],
+      locations,
     };
     setCache(cacheKey, data);
     res.json(data);
