@@ -69,33 +69,27 @@ async function updateLastAlertKeys(endpoint, keys) {
   );
 }
 
-// ── User prefs ───────────────────────────────────────────────────────
-async function getUserPrefs(userId) {
+// ── Tick lists ───────────────────────────────────────────────────────
+async function getTicklist(userId, listType) {
   const { rows } = await query(
-    `SELECT user_id, list_type, location_lat, location_lng, settings, updated_at
-     FROM user_prefs WHERE user_id = $1`,
-    [String(userId)]
+    `SELECT birds, fetched_at FROM ticklists
+      WHERE user_id = $1 AND list_type = $2`,
+    [String(userId), String(listType)]
   );
-  return rows[0] || null;
+  if (!rows[0]) return null;
+  return {
+    birds: rows[0].birds,
+    fetchedAt: new Date(rows[0].fetched_at).getTime(),
+  };
 }
 
-async function upsertUserPrefs({ userId, listType, lat, lng, settings }) {
+async function upsertTicklist(userId, listType, birds) {
   await query(
-    `INSERT INTO user_prefs (user_id, list_type, location_lat, location_lng, settings, updated_at)
-     VALUES ($1, $2, $3, $4, $5::jsonb, now())
-     ON CONFLICT (user_id) DO UPDATE
-       SET list_type = COALESCE(EXCLUDED.list_type, user_prefs.list_type),
-           location_lat = COALESCE(EXCLUDED.location_lat, user_prefs.location_lat),
-           location_lng = COALESCE(EXCLUDED.location_lng, user_prefs.location_lng),
-           settings = COALESCE(EXCLUDED.settings, user_prefs.settings),
-           updated_at = now()`,
-    [
-      String(userId),
-      listType || null,
-      lat ?? null,
-      lng ?? null,
-      settings ? JSON.stringify(settings) : null,
-    ]
+    `INSERT INTO ticklists (user_id, list_type, birds, fetched_at)
+     VALUES ($1, $2, $3::jsonb, now())
+     ON CONFLICT (user_id, list_type) DO UPDATE
+       SET birds = EXCLUDED.birds, fetched_at = now()`,
+    [String(userId), String(listType), JSON.stringify(birds)]
   );
 }
 
@@ -249,8 +243,8 @@ module.exports = {
   deletePushSubscription,
   loadAllPushSubscriptions,
   updateLastAlertKeys,
-  getUserPrefs,
-  upsertUserPrefs,
+  getTicklist,
+  upsertTicklist,
   upsertObservations,
   getObservationsByDate,
   getRelevantObsForMonth,

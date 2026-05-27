@@ -84,6 +84,8 @@ app.use((req, res, next) => {
 });
 
 // ─── Tick List Endpoint ───────────────────────────────────────────────
+const LIST_NAMES = { "1": "Krydsliste DK", "2": "Årsliste DK", "3": "Livslisten DK" };
+
 app.get("/api/ticklist", async (req, res) => {
   const { listType = "1", userId } = req.query;
   if (!userId) return res.status(400).json({ error: "userId is required" });
@@ -91,6 +93,26 @@ app.get("/api/ticklist", async (req, res) => {
   const cacheKey = `tick-${listType}-${userId}`;
   const cached = getCached(cacheKey, TICK_CACHE_TTL);
   if (cached) return res.json(cached);
+
+  if (db.isEnabled()) {
+    try {
+      const stored = await db.getTicklist(userId, listType);
+      if (stored && Date.now() - stored.fetchedAt < TICK_CACHE_TTL) {
+        const data = {
+          userId,
+          listType,
+          listName: LIST_NAMES[listType] || "Krydsliste",
+          total: stored.birds.length,
+          ticked: stored.birds.filter((b) => b.ticked).length,
+          birds: stored.birds,
+        };
+        setCache(cacheKey, data);
+        return res.json(data);
+      }
+    } catch (err) {
+      console.error("DB ticklist read failed:", err.message);
+    }
+  }
 
   try {
     const url = `https://netfugl.dk/ranking/${listType}/${userId}`;
@@ -185,6 +207,11 @@ const ticked = $(cells[1]).text().trim() === "X";
     };
 
     setCache(cacheKey, data);
+    if (db.isEnabled()) {
+      db.upsertTicklist(userId, listType, birds).catch((e) =>
+        console.error("DB ticklist upsert failed:", e.message)
+      );
+    }
     res.json(data);
   } catch (err) {
     console.error("Ticklist error:", err.message);
@@ -1142,33 +1169,6 @@ app.post("/api/push/unsubscribe", async (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── Prefs: load/save user settings (cross-device) ────────────────────
-app.get("/api/prefs", async (req, res) => {
-  const userId = String(req.query.userId || "").trim();
-  if (!userId) return res.status(400).json({ error: "userId required" });
-  if (!db.isEnabled()) return res.status(404).json({ error: "prefs unavailable" });
-  try {
-    const row = await db.getUserPrefs(userId);
-    if (!row) return res.status(404).json({ error: "no prefs for user" });
-    res.json(row);
-  } catch (err) {
-    console.error("Prefs GET error:", err.message);
-    res.status(500).json({ error: "Failed to read prefs", detail: err.message });
-  }
-});
-
-app.post("/api/prefs", async (req, res) => {
-  const { userId, listType, lat, lng, settings } = req.body || {};
-  if (!userId) return res.status(400).json({ error: "userId required" });
-  if (!db.isEnabled()) return res.json({ ok: false, reason: "db disabled" });
-  try {
-    await db.upsertUserPrefs({ userId, listType, lat, lng, settings });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("Prefs POST error:", err.message);
-    res.status(500).json({ error: "Failed to save prefs", detail: err.message });
-  }
-});
 
 // ─── Push: Background alert checker ───────────────────────────────────
 function normalizeName(name) {
@@ -1215,18 +1215,30 @@ async function fetchTickListData(userId, listType) {
   const cached = getCached(cacheKey, TICK_CACHE_TTL);
   if (cached) return cached;
 
+  if (db.isEnabled()) {
+    try {
+      const stored = await db.getTicklist(userId, listType);
+      if (stored && Date.now() - stored.fetchedAt < TICK_CACHE_TTL) {
+        const data = { birds: stored.birds };
+        setCache(cacheKey, data);
+        return data;
+      }
+    } catch (err) {
+      console.error("DB ticklist read failed:", err.message);
+    }
+  }
+
   const url = `https://netfugl.dk/ranking/${listType}/${userId}`;
   const response = await fetch(url);
   if (!response.ok) return null;
   const html = await response.text();
   const $ = cheerio.load(html);
-   
-   // Check if user not found
+
   if ($("p").text().includes("Klik her for at vende tilbage")) {
     console.log(`User ${userId} not found for push check`);
     return { birds: [] };
-   }
-   
+  }
+
   const birds = [];
   $("table.datatable tbody tr").each((i, row) => {
     const cells = $(row).find("td");
@@ -1239,11 +1251,16 @@ async function fetchTickListData(userId, listType) {
     const name = nameCell.replace(/\([^)]+\)/, "").trim();
     if (name) birds.push({ name, latin, ticked, isSU });
   });
-     // Return null if no birds found
   if (birds.length === 0) return null;
-     
+
   const data = { birds };
   setCache(cacheKey, data);
+
+  if (db.isEnabled()) {
+    db.upsertTicklist(userId, listType, birds).catch((e) =>
+      console.error("DB ticklist upsert failed:", e.message)
+    );
+  }
   return data;
 }
 

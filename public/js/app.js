@@ -450,19 +450,12 @@ const App = {
       }
 
       let observations;
-      const cachedObs = Storage.getObservations(date);
-      if (useCacheOnly && cachedObs) {
-        observations = cachedObs;
-        Storage.touchObservations(date);
-      } else {
-        try {
-          observations = await Scraper.fetchObservations("all", isToday ? null : date);
-          observations = await Scraper.resolveCoordinates(observations);
-          Storage.saveObservations(observations, date);
-        } catch (err) {
-          console.warn("Failed to fetch observations, using cached:", err);
-          observations = cachedObs;
-        }
+      try {
+        observations = await Scraper.fetchObservations("all", isToday ? null : date);
+        observations = await Scraper.resolveCoordinates(observations);
+      } catch (err) {
+        console.warn("Failed to fetch observations:", err);
+        observations = null;
       }
 
       if (observations) {
