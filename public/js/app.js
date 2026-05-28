@@ -27,9 +27,21 @@ const App = {
   refreshInterval: null,
   currentView: "alerts",
   sortMode: "distance",
+  obsFilter: "missing",
+  calendarView: "ai",
+  rawSort: { key: "score", dir: "desc" },
+  chatBusy: false,
+  chatLoaded: false,
   currentDate: todayDate(),
+  _expandedGroups: new Set(),
+  _expandedRawRows: new Set(),
+  _map: null,
+  _markers: [],
+  _userMarker: null,
 
   async init() {
+    this.calendarView = Storage.getCalendarViewMode();
+    Storage.getDeviceId();
     this.bindEvents();
     this.registerSW();
 
@@ -50,9 +62,22 @@ const App = {
   },
 
   registerSW() {
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(console.error);
-    }
+    if (!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker
+      .register("/sw.js", { updateViaCache: "none" })
+      .then((reg) => {
+        reg.update().catch(() => {});
+        reg.addEventListener("updatefound", () => {
+          const sw = reg.installing;
+          if (!sw) return;
+          sw.addEventListener("statechange", () => {
+            if (sw.state === "activated" && navigator.serviceWorker.controller) {
+              location.reload();
+            }
+          });
+        });
+      })
+      .catch(console.error);
   },
 
   getUserLocation() {
@@ -140,6 +165,51 @@ const App = {
       });
     });
 
+    document.querySelectorAll(".filter-btn[data-obs-filter]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this.obsFilter = btn.dataset.obsFilter;
+        document
+          .querySelectorAll(".filter-btn[data-obs-filter]")
+          .forEach((b) => b.classList.toggle("active", b === btn));
+        this.renderAlerts();
+      });
+    });
+
+    document.querySelectorAll(".filter-btn[data-calendar-view]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this.calendarView = btn.dataset.calendarView;
+        Storage.setCalendarViewMode(this.calendarView);
+        document
+          .querySelectorAll(".filter-btn[data-calendar-view]")
+          .forEach((b) => b.classList.toggle("active", b === btn));
+        this.renderCalendarView();
+      });
+    });
+
+    const chatForm = document.getElementById("chat-form");
+    const chatInput = document.getElementById("chat-input");
+    chatForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      this.sendChat();
+    });
+    chatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        this.sendChat();
+      }
+    });
+    chatInput.addEventListener("input", () => this.autosizeChatInput());
+    document.getElementById("btn-chat-clear").addEventListener("click", () => {
+      this.clearChat();
+    });
+    document.querySelectorAll(".chat-suggestion").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        chatInput.value = btn.dataset.prompt || btn.textContent;
+        this.autosizeChatInput();
+        chatInput.focus();
+      });
+    });
+
     document.getElementById("search-input").addEventListener("input", (e) => {
       this.filterBirdList(e.target.value);
     });
@@ -152,6 +222,17 @@ const App = {
     });
 
     this.bindSwipe(document.getElementById("view-alerts"));
+
+    document.getElementById("alerts-container").addEventListener("click", (e) => {
+      if (e.target.closest("a")) return;
+      const group = e.target.closest(".bird-tree-item--group");
+      if (!group) return;
+      const key = group.dataset.key;
+      if (!key) return;
+      if (this._expandedGroups.has(key)) this._expandedGroups.delete(key);
+      else this._expandedGroups.add(key);
+      this.renderAlerts();
+    });
   },
 
   bindSwipe(el) {
@@ -186,92 +267,166 @@ const App = {
     document.getElementById("date-next").disabled = this.currentDate === todayDate();
   },
 
-  async loadAIPredictions(forceRefresh = false) {
-    const banner = document.getElementById("ai-banner");
-    const emptyState = document.getElementById("ai-empty-state");
+  renderCalendarView() {
+    document.querySelectorAll(".filter-btn[data-calendar-view]").forEach((b) => {
+      b.classList.toggle("active", b.dataset.calendarView === this.calendarView);
+    });
+    const aiWrap = document.getElementById("calendar-ai-wrap");
+    const raw = document.getElementById("calendar-raw");
+    if (this.calendarView === "raw") {
+      if (aiWrap) aiWrap.style.display = "none";
+      if (raw) raw.style.display = "block";
+      this.loadRawDataset();
+    } else {
+      if (aiWrap) aiWrap.style.display = "block";
+      if (raw) raw.style.display = "none";
+      this.loadCalendar();
+    }
+  },
+
+  async loadRawDataset(forceRefresh = false) {
+    const raw = document.getElementById("calendar-raw");
     const settings = Storage.getSettings();
     if (!settings.userId || this.userLat == null || this.userLng == null) {
-      banner.style.display = "none";
-      if (emptyState) emptyState.style.display = "none";
+      raw.innerHTML = `<div class="empty-state"><div class="emoji">📊</div><p>Mangler bruger-ID eller position</p></div>`;
       return;
     }
 
-    const cached = Storage.getPredictions();
+    const cached = Storage.getRawDataset();
     const ageMs = cached?._savedAt ? Date.now() - cached._savedAt : Infinity;
     const fresh = ageMs < 60 * 60 * 1000;
 
     if (cached) {
-      this.renderPredictions(cached);
-    } else if (emptyState) {
-      emptyState.style.display = "block";
+      this.renderRawDataset(cached);
+    } else {
+      raw.innerHTML = `<div class="empty-state"><div class="emoji">⏳</div><p>Henter rådata…</p></div>`;
     }
     if (fresh && !forceRefresh) return;
 
     try {
-      const data = await Scraper.fetchPredictions(
-        settings.userId,
-        settings.listType,
-        this.userLat,
-        this.userLng
-      );
+      const data = await Scraper.fetchPredictorDataset({
+        userId: settings.userId,
+        listType: settings.listType,
+        lat: this.userLat,
+        lng: this.userLng,
+        mode: "day",
+      });
       data._savedAt = Date.now();
-      Storage.savePredictions(data);
-      this.renderPredictions(data);
+      Storage.saveRawDataset(data);
+      this.renderRawDataset(data);
     } catch (err) {
-      console.warn("AI predictions failed:", err.message);
+      console.warn("Raw dataset failed:", err.message);
       if (!cached) {
-        banner.style.display = "none";
-        if (emptyState) {
-          emptyState.innerHTML = `<div class="empty-state"><div class="emoji">⚠️</div><p>Kunne ikke hente forudsigelser</p></div>`;
-          emptyState.style.display = "block";
-        }
+        raw.innerHTML = `<div class="empty-state"><div class="emoji">⚠️</div><p>Kunne ikke hente rådata: ${esc(err.message)}</p></div>`;
       }
     }
   },
 
-  renderPredictions(data) {
-    const banner = document.getElementById("ai-banner");
-    const meta = document.getElementById("ai-banner-meta");
-    const body = document.getElementById("ai-banner-body");
-    const emptyState = document.getElementById("ai-empty-state");
-
-    if (!data || (!data.predictions?.length && !data.note)) {
-      banner.style.display = "none";
+  renderRawDataset(data) {
+    const raw = document.getElementById("calendar-raw");
+    if (!data?.candidates?.length) {
+      raw.innerHTML = `<div class="empty-state"><div class="emoji">📊</div><p>Ingen kandidater i rådata</p></div>`;
       return;
     }
-    banner.style.display = "block";
-    if (emptyState) emptyState.style.display = "none";
 
     const ageMin = Math.round((Date.now() - new Date(data.generatedAt).getTime()) / 60000);
-    meta.textContent = ageMin <= 1 ? "Lige nu" : `${ageMin} min siden`;
+    const ageLabel = ageMin <= 1 ? "Lige nu" : `${ageMin} min siden`;
 
-    if (!data.predictions.length && data.note) {
-      body.innerHTML = `<div class="ai-empty">${esc(data.note)}</div>`;
-      return;
-    }
+    const sortKey = this.rawSort.key;
+    const sortDir = this.rawSort.dir === "asc" ? 1 : -1;
+    const rows = [...data.candidates];
+    rows.sort((a, b) => {
+      const va = rawSortValue(a, sortKey);
+      const vb = rawSortValue(b, sortKey);
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      if (typeof va === "string") return sortDir * va.localeCompare(vb, "da");
+      return sortDir * (va - vb);
+    });
 
-    body.innerHTML = data.predictions
-      .map((p) => {
-        const conf =
-          p.confidence === "høj" ? "high" : p.confidence === "mellem" ? "med" : "low";
-        const dates = (p.suggestedDates || []).map((d) => esc(d)).join(", ");
-        const speciesClean = (p.species || "").replace(/\s*\([^)]*\)\s*$/, "").trim();
-        const latinClean = (p.latin || "").trim();
-        const speciesLower = speciesClean.toLowerCase();
-        const latinLower = latinClean.toLowerCase();
-        const showLatin = latinClean && latinLower !== speciesLower;
-        return `
-          <div class="ai-card ai-card--${conf}">
-            <div class="ai-card-head">
-              <div class="ai-card-species">${esc(speciesClean)}${showLatin ? ` <span class="ai-card-latin">${esc(latinClean)}</span>` : ""}</div>
-              <div class="ai-card-conf">${esc(p.confidence)}</div>
-            </div>
-            <div class="ai-card-loc">📍 ${esc(p.location)}</div>
-            ${dates ? `<div class="ai-card-dates">📅 ${dates}</div>` : ""}
-            <div class="ai-card-reason">${esc(p.reasoning)}</div>
-          </div>`;
-      })
-      .join("");
+    const arrow = (key) =>
+      key === sortKey ? (sortDir > 0 ? " ▲" : " ▼") : "";
+
+    const tableHead = `
+      <thead>
+        <tr>
+          <th data-sort="name">Art${arrow("name")}</th>
+          <th data-sort="location">Lokalitet${arrow("location")}</th>
+          <th data-sort="score" class="num">Score${arrow("score")}</th>
+          <th data-sort="band">Bånd${arrow("band")}</th>
+          <th data-sort="evidence" class="num">Evidens${arrow("evidence")}</th>
+          <th data-sort="lastObs">Sidste obs${arrow("lastObs")}</th>
+        </tr>
+      </thead>`;
+
+    const body = rows.map((c, i) => {
+      const key = `${c.latin}|${c.cluster?.loknr || ""}|${i}`;
+      const expanded = this._expandedRawRows.has(key);
+      const latinShown = c.latin && c.latin.toLowerCase() !== (c.name || "").toLowerCase();
+      const lastObs = (c.evidence || []).reduce((acc, e) => (e.date > acc ? e.date : acc), "");
+      const evCount = (c.evidence || []).length;
+      const headRow = `
+        <tr class="raw-row${expanded ? " raw-row--open" : ""}" data-raw-key="${esc(key)}">
+          <td>
+            <div class="raw-species">${esc(c.name || c.species || "—")}</div>
+            ${latinShown ? `<div class="raw-latin">${esc(c.latin)}</div>` : ""}
+          </td>
+          <td>${esc(c.cluster?.name || "—")}</td>
+          <td class="num">${(c.scoreNorm != null ? c.scoreNorm : c.score).toFixed(2)}</td>
+          <td><span class="raw-band raw-band--${esc(c.band || "lav")}">${esc(c.band || "—")}</span></td>
+          <td class="num">${evCount}</td>
+          <td>${esc(lastObs || "—")}</td>
+        </tr>`;
+      const evidenceRows = !expanded ? "" : `
+        <tr class="raw-detail"><td colspan="6">
+          ${renderRawEvidence(c)}
+        </td></tr>`;
+      return headRow + evidenceRows;
+    }).join("");
+
+    raw.innerHTML = `
+      <div class="raw-header">
+        <div class="raw-title">📊 Rådata · ${rows.length} kandidater</div>
+        <div class="raw-actions">
+          <span class="raw-meta">${ageLabel}</span>
+          <button class="btn-link" id="btn-raw-csv">⬇️ CSV</button>
+          <button class="btn-link" id="btn-raw-refresh">🔄 Opdater</button>
+        </div>
+      </div>
+      <div class="raw-dataset-wrap">
+        <table class="raw-dataset">${tableHead}<tbody>${body}</tbody></table>
+      </div>`;
+
+    raw.querySelectorAll("th[data-sort]").forEach((th) => {
+      th.addEventListener("click", () => {
+        const key = th.dataset.sort;
+        if (this.rawSort.key === key) {
+          this.rawSort.dir = this.rawSort.dir === "asc" ? "desc" : "asc";
+        } else {
+          this.rawSort.key = key;
+          this.rawSort.dir = key === "name" || key === "location" || key === "band" ? "asc" : "desc";
+        }
+        this.renderRawDataset(data);
+      });
+    });
+
+    raw.querySelectorAll(".raw-row").forEach((tr) => {
+      tr.addEventListener("click", () => {
+        const k = tr.dataset.rawKey;
+        if (!k) return;
+        if (this._expandedRawRows.has(k)) this._expandedRawRows.delete(k);
+        else this._expandedRawRows.add(k);
+        this.renderRawDataset(data);
+      });
+    });
+
+    document.getElementById("btn-raw-refresh")?.addEventListener("click", () => {
+      this.loadRawDataset(true);
+    });
+    document.getElementById("btn-raw-csv")?.addEventListener("click", () => {
+      downloadRawCsv(rows);
+    });
   },
 
   expectedCalendarMonths() {
@@ -289,8 +444,8 @@ const App = {
     const settings = Storage.getSettings();
     const body = document.getElementById("calendar-body");
     const meta = document.getElementById("calendar-meta");
-    if (!settings.userId || this.userLat == null || this.userLng == null) {
-      body.innerHTML = `<div class="empty-state"><div class="emoji">📍</div><p>Position eller bruger-ID mangler</p></div>`;
+    if (!settings.userId) {
+      body.innerHTML = `<div class="empty-state"><div class="emoji">👤</div><p>Bruger-ID mangler</p></div>`;
       meta.textContent = "";
       return;
     }
@@ -322,8 +477,6 @@ const App = {
         const monthData = await Scraper.fetchCalendarMonth(
           settings.userId,
           settings.listType,
-          this.userLat,
-          this.userLng,
           month
         );
         months.push(monthData);
@@ -401,15 +554,21 @@ const App = {
 
     document.getElementById("view-alerts").style.display = view === "alerts" ? "block" : "none";
     document.getElementById("view-list").style.display = view === "list" ? "block" : "none";
-    document.getElementById("view-ai").style.display = view === "ai" ? "block" : "none";
+    document.getElementById("view-ai").classList.toggle("chat-open", view === "ai");
+    document.body.classList.toggle("chat-active", view === "ai");
     document.getElementById("view-calendar").style.display = view === "calendar" ? "block" : "none";
     document.getElementById("search-bar").style.display = view === "list" ? "block" : "none";
     document.getElementById("sort-bar").style.display = view === "alerts" ? "flex" : "none";
+    document.getElementById("obs-filter-bar").style.display = view === "alerts" ? "flex" : "none";
 
     if (view === "list") this.renderBirdList();
-    if (view === "alerts") this.renderAlerts();
-    if (view === "ai") this.loadAIPredictions();
-    if (view === "calendar") this.loadCalendar();
+    if (view === "alerts") {
+      this.initMap();
+      this.renderAlerts();
+      if (this._map) requestAnimationFrame(() => this._map.resize());
+    }
+    if (view === "ai") this.openChat();
+    if (view === "calendar") this.renderCalendarView();
   },
 
   async saveSettings() {
@@ -477,6 +636,7 @@ const App = {
 
       const alerts = Scraper.matchAlerts(tickList, observations, this.userLat, this.userLng);
       Storage.saveAlerts(alerts);
+      Storage.saveObservations(observations);
 
       this.renderStats(tickList, alerts, observations);
       this.renderAlerts();
@@ -625,6 +785,9 @@ const App = {
 
     const alertEl = document.getElementById("stat-alerts");
     alertEl.className = "stat-value" + (matched.size > 0 ? " alert" : "");
+
+    const obsCount = observations?.observations?.length ?? 0;
+    document.getElementById("stat-observations").textContent = obsCount;
   },
 
   renderBirdList(filter = "") {
@@ -640,17 +803,26 @@ const App = {
       return;
     }
 
-    const filterLower = filter.toLowerCase();
     const artIdMap = Storage.get("artIdMap") || {};
     const speciesMap = Storage.get("speciesMap") || {};
+
+    let matcher = null;
+    const trimmed = (filter || "").trim();
+    if (trimmed.length >= 3) {
+      try {
+        matcher = new RegExp(trimmed, "i");
+      } catch {
+        matcher = null;
+      }
+    }
 
     const birds = [];
     const seen = new Set();
     for (const bird of tickList.birds) {
-      if (!seen.has(bird.latin || bird.name)) {
-        seen.add(bird.latin || bird.name);
-        birds.push(bird);
-      }
+      if (seen.has(bird.latin || bird.name)) continue;
+      if (matcher && !matcher.test(bird.name || "") && !matcher.test(bird.latin || "")) continue;
+      seen.add(bird.latin || bird.name);
+      birds.push(bird);
     }
 
     container.innerHTML = birds
@@ -678,15 +850,121 @@ const App = {
       .join("");
   },
 
+  initMap() {
+    if (this._map || typeof maplibregl === "undefined") return;
+    const el = document.getElementById("obs-map");
+    if (!el) return;
+    this._map = new maplibregl.Map({
+      container: el,
+      style: "https://tiles.openfreemap.org/styles/liberty",
+      center: [11.0, 56.0],
+      zoom: 5.7,
+      attributionControl: { compact: true },
+    });
+    this._map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+  },
+
+  renderMap(items) {
+    if (!this._map) return;
+    if (!this._map.isStyleLoaded()) {
+      this._map.once("load", () => this.renderMap(items));
+      return;
+    }
+
+    for (const m of this._markers) m.remove();
+    this._markers = [];
+
+    const bounds = new maplibregl.LngLatBounds();
+    let any = false;
+    for (const obs of items) {
+      if (obs.lat == null || obs.lng == null) continue;
+      let kind = "normal";
+      if (obs.ticked) kind = "ticked";
+      else if (obs.rare) kind = "rare";
+      else if (obs.scarce) kind = "scarce";
+
+      const el = document.createElement("div");
+      el.className = `obs-marker obs-marker--${kind}`;
+
+      const popupHtml = `<strong>${esc(obs.species || "")}</strong><br>${esc(obs.location || "")}${obs.count ? ` · ${obs.count} stk` : ""}${obs.time ? `<br>🕐 ${esc(obs.time)}` : ""}`;
+      const marker = new maplibregl.Marker({ element: el })
+        .setLngLat([obs.lng, obs.lat])
+        .setPopup(new maplibregl.Popup({ offset: 12, closeButton: false }).setHTML(popupHtml))
+        .addTo(this._map);
+      this._markers.push(marker);
+      bounds.extend([obs.lng, obs.lat]);
+      any = true;
+    }
+
+    if (this.userLat != null && this.userLng != null) {
+      if (!this._userMarker) {
+        const el = document.createElement("div");
+        el.className = "user-marker";
+        el.innerHTML = '<div class="user-marker-pulse"></div><div class="user-marker-dot"></div>';
+        this._userMarker = new maplibregl.Marker({ element: el })
+          .setLngLat([this.userLng, this.userLat])
+          .setPopup(new maplibregl.Popup({ offset: 12, closeButton: false }).setHTML("📍 Din position"))
+          .addTo(this._map);
+      } else {
+        this._userMarker.setLngLat([this.userLng, this.userLat]);
+      }
+      bounds.extend([this.userLng, this.userLat]);
+      any = true;
+    }
+
+    if (any) {
+      this._map.fitBounds(bounds, { padding: 30, maxZoom: 10, duration: 400 });
+    }
+  },
+
+  buildObservationItems(mode) {
+    if (mode === "all") {
+      const observations = Storage.getObservations();
+      const list = observations?.observations;
+      if (!list || !list.length) return [];
+
+      const tickList = Storage.getTickList();
+      const tickedLatin = new Set();
+      const tickedName = new Set();
+      if (tickList?.birds) {
+        for (const b of tickList.birds) {
+          if (b.ticked) {
+            if (b.latin) tickedLatin.add(Scraper.normalizeName(b.latin));
+            if (b.name) tickedName.add(Scraper.normalizeName(b.name));
+          }
+        }
+      }
+
+      return list.map((obs) => {
+        const dist = Scraper.distanceKm(this.userLat, this.userLng, obs.lat, obs.lng);
+        const latinKey = obs.latin ? Scraper.normalizeName(obs.latin) : "";
+        const nameKey = obs.species ? Scraper.normalizeName(obs.species) : "";
+        const ticked = tickedLatin.has(latinKey) || tickedName.has(nameKey);
+        return {
+          ...obs,
+          distance: dist != null ? Math.round(dist * 10) / 10 : null,
+          ticked,
+        };
+      });
+    }
+    return Storage.getAlerts() || [];
+  },
+
   renderAlerts() {
     const container = document.getElementById("alerts-container");
-    let alerts = Storage.getAlerts();
+    const mode = this.obsFilter;
+    const items = this.buildObservationItems(mode);
 
-    if (!alerts || alerts.length === 0) {
+    this.renderMap(items || []);
+
+    if (!items || items.length === 0) {
+      const msg = mode === "all"
+        ? "Ingen observationer på denne dag"
+        : "Ingen manglende arter spottet i dag";
       container.innerHTML = `
         <div class="empty-state">
           <div class="emoji">🔭</div>
-          <p>Ingen manglende arter spottet i dag</p>
+          <p>${msg}</p>
           <p style="margin-top: 8px; font-size: 13px;">Tryk 🔄 for at opdatere</p>
         </div>`;
       this._lastAlertNodes = null;
@@ -694,7 +972,7 @@ const App = {
     }
 
     const speciesGroups = new Map();
-    for (const alert of alerts) {
+    for (const alert of items) {
       const speciesKey = alert.species + "|" + alert.latin;
       if (!speciesGroups.has(speciesKey)) {
         speciesGroups.set(speciesKey, []);
@@ -728,6 +1006,7 @@ const App = {
         rare: obsArray[0].rare,
         scarce: obsArray[0].scarce,
         seasonal: obsArray[0].seasonal,
+        ticked: obsArray[0].ticked,
         artId: obsArray[0].artId,
         locations: locations.join(", "),
         count: total,
@@ -751,6 +1030,8 @@ const App = {
     const finalTree = [];
     for (const group of sortedGroups) {
       finalTree.push(group);
+      const groupKey = `g:${group.species}|${group.latin}`;
+      if (!this._expandedGroups.has(groupKey)) continue;
       for (const item of tree) {
         if (item.type === "observation" &&
             item.species === group.species &&
@@ -779,15 +1060,22 @@ const App = {
         modifier = "seasonal";
         badge = '<span class="badge badge-seasonal">Periodisk</span>';
       }
+      const tickedBadge = item.ticked ? '<span class="badge badge-ticked">✓ Krydset</span>' : "";
 
       const dofUrl = Scraper.getDofbasenUrl(item.artId);
       const locCount = item.locations ? [...new Set(item.locations.split(", "))].size : 0;
+      const tickedClass = item.ticked ? " bird-card--ticked" : "";
+      const groupKey = `g:${item.species}|${item.latin}`;
+      const expanded = this._expandedGroups.has(groupKey);
+      const collapsedClass = expanded ? "" : " bird-card--collapsed";
+      const chevron = expanded ? "▾" : "▸";
 
       const html = `<div class="group-header">
             <div class="group-title">
               <div>
                 <div class="species-name">
-                  ${dofUrl ? `<a href="${esc(dofUrl)}" target="_blank" rel="noopener" class="species-link">${esc(item.species)}</a>` : esc(item.species)}${badge}
+                  <span class="group-chevron">${chevron}</span>
+                  ${dofUrl ? `<a href="${esc(dofUrl)}" target="_blank" rel="noopener" class="species-link">${esc(item.species)}</a>` : esc(item.species)}${badge}${tickedBadge}
                 </div>
                 <div class="latin-name">${esc(item.latin)}</div>
               </div>
@@ -796,9 +1084,9 @@ const App = {
           </div>`;
 
       return {
-        key: `g:${item.species}|${item.latin}`,
-        sig: `${item.count || 0}|${locCount}|${modifier}`,
-        outerClass: `bird-tree-item bird-tree-item--group bird-card ${modifier}`,
+        key: groupKey,
+        sig: `${item.count || 0}|${locCount}|${modifier}|${item.ticked ? 1 : 0}|${expanded ? 1 : 0}`,
+        outerClass: `bird-tree-item bird-tree-item--group bird-card ${modifier}${tickedClass}${collapsedClass}`,
         html,
       };
     }
@@ -854,6 +1142,7 @@ const App = {
       } else {
         const node = document.createElement("div");
         node.className = outerClass + " enter";
+        node.dataset.key = key;
         node.innerHTML = html;
         requestAnimationFrame(() =>
           requestAnimationFrame(() => node.classList.remove("enter"))
@@ -910,6 +1199,74 @@ function esc(str) {
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;
+}
+
+function rawSortValue(c, key) {
+  switch (key) {
+    case "name": return (c.name || c.species || "").toLowerCase();
+    case "location": return (c.cluster?.name || "").toLowerCase();
+    case "score": return c.scoreNorm != null ? c.scoreNorm : c.score;
+    case "band":
+      return c.band === "høj" ? 3 : c.band === "mellem" ? 2 : c.band === "lav" ? 1 : 0;
+    case "evidence": return (c.evidence || []).length;
+    case "lastObs": return (c.evidence || []).reduce((acc, e) => (e.date > acc ? e.date : acc), "");
+    default: return 0;
+  }
+}
+
+function renderRawEvidence(c) {
+  const nearby = (c.cluster?.nearby || []).slice(0, 5);
+  const ev = c.evidence || [];
+  const nearbyHtml = nearby.length
+    ? `<div class="raw-nearby"><strong>Nærliggende:</strong> ${nearby.map((n) =>
+        `${esc(n.location)}${n.distKm != null ? ` (${n.distKm} km)` : ""}`).join(" · ")}</div>`
+    : "";
+  if (!ev.length) {
+    return `${nearbyHtml}<div class="raw-no-evidence">Ingen evidens</div>`;
+  }
+  const list = ev.map((e) => `
+    <li>
+      <span class="raw-ev-date">${esc(e.date || "")}</span>
+      <span class="raw-ev-loc">${esc(e.location || "")}</span>
+      ${e.count != null ? `<span class="raw-ev-count">${esc(String(e.count))} stk</span>` : ""}
+      ${e.observer ? `<span class="raw-ev-obs">👤 ${esc(e.observer)}</span>` : ""}
+      ${e.behaviour ? `<span class="raw-ev-beh">📋 ${esc(e.behaviour)}</span>` : ""}
+    </li>`).join("");
+  return `${nearbyHtml}<ul class="raw-evidence">${list}</ul>`;
+}
+
+function downloadRawCsv(rows) {
+  const headers = ["art", "latin", "lokalitet", "loknr", "score", "scoreNorm", "band", "evidens_antal", "sidste_obs"];
+  const csvRows = [headers.join(",")];
+  for (const c of rows) {
+    const last = (c.evidence || []).reduce((acc, e) => (e.date > acc ? e.date : acc), "");
+    csvRows.push([
+      c.name || c.species || "",
+      c.latin || "",
+      c.cluster?.name || "",
+      c.cluster?.loknr || "",
+      c.score != null ? c.score.toFixed(4) : "",
+      c.scoreNorm != null ? c.scoreNorm.toFixed(4) : "",
+      c.band || "",
+      (c.evidence || []).length,
+      last,
+    ].map(csvCell).join(","));
+  }
+  const blob = new Blob(["﻿" + csvRows.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `predictor-dataset-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function csvCell(v) {
+  const s = String(v ?? "");
+  if (/[",\n;]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
 }
 
 const MONTH_NAMES_DA = [
@@ -973,5 +1330,152 @@ function renderCalendarMonth(monthData, tickedLatin) {
       ${inner}
     </section>`;
 }
+
+function renderChatMessages(messages) {
+  const container = document.getElementById("chat-messages");
+  if (!container) return;
+  if (!messages.length) {
+    container.innerHTML = `
+      <div class="chat-empty">
+        <div class="emoji">💬</div>
+        <p>Spørg ornitologen om manglende arter, lokaliteter eller hvad du kan se på vej hjem fra arbejde.</p>
+      </div>`;
+    return;
+  }
+  container.innerHTML = messages
+    .filter((m) => m.role === "user" || (m.role === "assistant" && m.content))
+    .map((m) => {
+      if (m.role === "user") {
+        return `<div class="chat-bubble chat-bubble--user">${esc(m.content || "")}</div>`;
+      }
+      return `<div class="chat-bubble chat-bubble--assistant">${renderChatMarkdown(m.content || "")}</div>`;
+    })
+    .join("");
+  container.scrollTop = container.scrollHeight;
+}
+
+function renderChatMarkdown(text) {
+  // Light markdown: bold, italics, line breaks, lists, images. Trust the
+  // model not to inject HTML (we esc() first), then unescape allowed markers.
+  let out = esc(text);
+  // Images — only same-origin /img/ paths allowed, to avoid arbitrary remote loads.
+  out = out.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, alt, src) => {
+    if (!/^\/img\//.test(src)) return "";
+    return `<img class="chat-img" src="${src}" alt="${alt || ""}" loading="lazy">`;
+  });
+  // Code spans
+  out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Bold + italic
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+  // Bullet list lines starting with "- " or "* "
+  out = out.replace(/(?:^|\n)([-*]) +([^\n]+)/g, (m, _b, t) => `\n<li>${t}</li>`);
+  out = out.replace(/(<li>[\s\S]+?<\/li>)(?=\n[^<]|\n*$)/g, "<ul>$1</ul>");
+  // Line breaks
+  out = out.replace(/\n/g, "<br>");
+  return out;
+}
+
+Object.assign(App, {
+  async openChat() {
+    setTimeout(() => this.autosizeChatInput(), 0);
+    const existing = Storage.getChatMessages();
+    if (this.chatLoaded) {
+      renderChatMessages(existing || []);
+      return;
+    }
+    this.chatLoaded = true;
+    renderChatMessages(existing || []);
+    const deviceId = Storage.getDeviceId();
+    try {
+      const data = await Scraper.fetchChatHistory(deviceId);
+      const fetched = (data.messages || []).map((m) => ({
+        role: m.role,
+        content: m.content || "",
+      }));
+      // Don't clobber an in-flight send that beat the history fetch.
+      const current = Storage.getChatMessages() || [];
+      if (current.length <= fetched.length) {
+        Storage.saveChatMessages(fetched);
+        renderChatMessages(fetched);
+      }
+    } catch (err) {
+      console.warn("Chat history failed:", err.message);
+    }
+  },
+
+  autosizeChatInput() {
+    const ta = document.getElementById("chat-input");
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 160) + "px";
+  },
+
+  async sendChat() {
+    if (this.chatBusy) return;
+    const input = document.getElementById("chat-input");
+    const text = (input.value || "").trim();
+    if (!text) return;
+
+    const settings = Storage.getSettings();
+    const deviceId = Storage.getDeviceId();
+    const messages = Storage.getChatMessages() || [];
+    messages.push({ role: "user", content: text });
+    messages.push({ role: "assistant", content: "…" });
+    Storage.saveChatMessages(messages);
+    renderChatMessages(messages);
+
+    input.value = "";
+    this.autosizeChatInput();
+    this.chatBusy = true;
+    this.setChatBusy(true);
+
+    try {
+      const res = await Scraper.sendChatMessage({
+        deviceId,
+        userId: settings.userId,
+        listType: settings.listType,
+        lat: this.userLat,
+        lng: this.userLng,
+        message: text,
+      });
+      messages.pop();
+      messages.push({ role: "assistant", content: res.content || "" });
+      Storage.saveChatMessages(messages);
+      renderChatMessages(messages);
+    } catch (err) {
+      console.warn("Chat send failed:", err.message);
+      messages.pop();
+      messages.push({
+        role: "assistant",
+        content: `⚠️ ${err.message || "Chat fejlede"}`,
+      });
+      Storage.saveChatMessages(messages);
+      renderChatMessages(messages);
+    } finally {
+      this.chatBusy = false;
+      this.setChatBusy(false);
+    }
+  },
+
+  setChatBusy(busy) {
+    const send = document.getElementById("chat-send");
+    const input = document.getElementById("chat-input");
+    if (send) send.disabled = busy;
+    if (input) input.disabled = busy;
+  },
+
+  async clearChat() {
+    if (!confirm("Ryd hele chatten?")) return;
+    const deviceId = Storage.getDeviceId();
+    try {
+      await Scraper.clearChatHistory(deviceId);
+    } catch (err) {
+      console.warn("Chat clear failed:", err.message);
+    }
+    Storage.saveChatMessages([]);
+    renderChatMessages([]);
+  },
+});
 
 document.addEventListener("DOMContentLoaded", () => App.init());

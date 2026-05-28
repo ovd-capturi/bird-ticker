@@ -1,4 +1,4 @@
-const CACHE_NAME = "bird-ticker-v10";
+const CACHE_NAME = "bird-ticker-v13";
 const STATIC_ASSETS = [
   "/",
   "/index.html",
@@ -28,6 +28,7 @@ self.addEventListener("activate", (event) => {
 });
 
 // Fetch: network-first for API + app shell. Cache fallback only on offline.
+// Bypass HTTP cache for same-origin GETs so iOS PWA can't serve stale assets.
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
@@ -36,8 +37,14 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  const sameOriginGet =
+    event.request.method === "GET" && url.origin === self.location.origin;
+  const req = sameOriginGet
+    ? new Request(event.request, { cache: "no-store" })
+    : event.request;
+
   event.respondWith(
-    fetch(event.request)
+    fetch(req)
       .then((response) => {
         if (response.ok && event.request.method === "GET") {
           const clone = response.clone();

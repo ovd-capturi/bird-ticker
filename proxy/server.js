@@ -4,9 +4,12 @@ const cheerio = require("cheerio");
 const iconv = require("iconv-lite");
 const webpush = require("web-push");
 const path = require("path");
+const { performance } = require("perf_hooks");
 const db = require("./db");
 const { runMigrations } = require("./db/migrate");
-const embeddings = require("./db/embeddings");
+const predictor = require("./predictor");
+const backfill = require("./backfill");
+const chatTools = require("./chat-tools");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,13 +24,8 @@ webpush.setVapidDetails(
   VAPID_PRIVATE
 );
 
-// Cache stores. Bounded LRU-ish: oldest entries evicted past MAX_CACHE_ENTRIES
-// to prevent unbounded heap growth on long-running App Service container.
-const cache = new Map();
-const MAX_CACHE_ENTRIES = 500;
-
-// In-flight request dedupe: parallel callers wait on the same upstream fetch.
-// Without this, two concurrent cold requests both scrape DOFbasen.
+// In-flight request dedupe: parallel callers (during notification refresh or
+// backfill) wait on the same upstream fetch instead of double-scraping.
 const inflight = new Map();
 function dedupe(key, fn) {
   if (inflight.has(key)) return inflight.get(key);
@@ -40,23 +38,6 @@ function dedupe(key, fn) {
 
 // Push subscription store: Map<subKey, { subscription, userId, listType, lastAlertKeys }>
 const subscribers = new Map();
-const TICK_CACHE_TTL = 60 * 60 * 1000; // 1 hour
-const OBS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-function getCached(key, ttl) {
-  const entry = cache.get(key);
-  if (entry && Date.now() - entry.time < ttl) return entry.data;
-  return null;
-}
-
-function setCache(key, data) {
-  if (cache.has(key)) cache.delete(key);
-  cache.set(key, { data, time: Date.now() });
-  if (cache.size > MAX_CACHE_ENTRIES) {
-    const firstKey = cache.keys().next().value;
-    cache.delete(firstKey);
-  }
-}
 
 // JSON body parsing for push subscription
 app.use(express.json());
@@ -64,13 +45,15 @@ app.use(express.json());
 // Gzip/brotli responses to cut bandwidth + perceived latency.
 app.use(compression());
 
-// Serve static frontend files with browser caching. Service worker (sw.js)
-// must NOT be long-cached or PWA updates stall.
+// Serve static frontend files. Assets are not fingerprinted, so HTML/JS/CSS
+// must revalidate every request — iOS PWAs otherwise hold stale code across
+// reloads. Long cache only for binary assets (icons/images).
 app.use(express.static(path.join(__dirname, "..", "public"), {
-  maxAge: "1d",
   etag: true,
   setHeaders: (res, filePath) => {
-    if (filePath.endsWith("sw.js") || filePath.endsWith("manifest.json")) {
+    if (/\.(png|jpg|jpeg|gif|webp|svg|ico|woff2?)$/i.test(filePath)) {
+      res.setHeader("Cache-Control", "public, max-age=86400");
+    } else {
       res.setHeader("Cache-Control", "no-cache");
     }
   },
@@ -90,132 +73,34 @@ app.get("/api/ticklist", async (req, res) => {
   const { listType = "1", userId } = req.query;
   if (!userId) return res.status(400).json({ error: "userId is required" });
 
-  const cacheKey = `tick-${listType}-${userId}`;
-  const cached = getCached(cacheKey, TICK_CACHE_TTL);
-  if (cached) return res.json(cached);
-
-  if (db.isEnabled()) {
-    try {
-      const stored = await db.getTicklist(userId, listType);
-      if (stored && Date.now() - stored.fetchedAt < TICK_CACHE_TTL) {
-        const data = {
-          userId,
-          listType,
-          listName: LIST_NAMES[listType] || "Krydsliste",
-          total: stored.birds.length,
-          ticked: stored.birds.filter((b) => b.ticked).length,
-          birds: stored.birds,
-        };
-        setCache(cacheKey, data);
-        return res.json(data);
-      }
-    } catch (err) {
-      console.error("DB ticklist read failed:", err.message);
-    }
+  if (!db.isEnabled()) {
+    return res.status(503).json({ error: "DB not configured" });
   }
 
   try {
-    const url = `https://netfugl.dk/ranking/${listType}/${userId}`;
-    const response = await fetch(url);
-
-    // Check if user not found (even before checking status)
-    if (response.status !== 200) {
-      console.log(`Netfugl returned ${response.status} for user ${userId}`);
-      // Try to get HTML to see if it's the not found page
-      const html = await response.text();
-      const $ = cheerio.load(html);
-      const noUserMsg = $("p").text().includes("Klik her for at vende tilbage");
-      
-      if (noUserMsg) {
-        return res.json({
-          userId,
-          listType,
-          listName: "Not found",
-          total: 0,
-          ticked: 0,
-          birds: [],
-          error: "User not found on Netfugl"
-         });
-      }
-      
-      throw new Error(`Netfugl returned ${response.status}`);
-    }
-
-    const html = await response.text();
-    const $ = cheerio.load(html);
-    
-    // Check if user not found (page contains "Klik her for at vende tilbage")
-    const noUserMsg = $("p").text().includes("Klik her for at vende tilbage");
-    if (noUserMsg) {
-      console.log(`User ${userId} not found on Netfugl`);
+    const stored = await db.getTicklist(userId, listType);
+    if (!stored) {
       return res.json({
         userId,
         listType,
-        listName: "Not found",
+        listName: LIST_NAMES[listType] || "Krydsliste",
         total: 0,
         ticked: 0,
         birds: [],
-        error: "User not found on Netfugl"
+        error: "No cached ticklist; seeded on next notification poll",
       });
     }
-  
-    const birds = [];
-
-    $("table.datatable tbody tr").each((i, row) => {
-      const cells = $(row).find("td");
-      if (cells.length < 4) return;
-
-      const number = parseInt($(cells[0]).text().trim(), 10);
-const ticked = $(cells[1]).text().trim() === "X";
-      const isSU = $(cells[2]).text().trim() === "*";
-      const nameCell = $(cells[3]).text().trim();
-
-      // Parse "Agerhøne (Perdix perdix)"
-      const latinMatch = nameCell.match(/\(([^)]+)\)/);
-      const latin = latinMatch ? latinMatch[1].trim() : "";
-      const name = nameCell.replace(/\([^)]+\)/, "").trim();
-
-      if (name) {
-        birds.push({ number, name, latin, ticked, isSU });
-      }
-    });
-
-    // Extract list name from page
-    const listName = $("p.page-headline").text().trim() || "Krydsliste";
-
-    // Check if no birds found (could be user not found page without the message)
-    if (birds.length === 0) {
-      console.log(`No birds found for user ${userId}`);
-      return res.json({
-        userId,
-        listType,
-        listName: "No data",
-        total: 0,
-        ticked: 0,
-        birds: [],
-        error: "User not found or no data"
-       });
-     }
-
-    const data = {
+    res.json({
       userId,
       listType,
-      listName,
-      total: birds.length,
-      ticked: birds.filter((b) => b.ticked).length,
-      birds,
-    };
-
-    setCache(cacheKey, data);
-    if (db.isEnabled()) {
-      db.upsertTicklist(userId, listType, birds).catch((e) =>
-        console.error("DB ticklist upsert failed:", e.message)
-      );
-    }
-    res.json(data);
+      listName: LIST_NAMES[listType] || "Krydsliste",
+      total: stored.birds.length,
+      ticked: stored.birds.filter((b) => b.ticked).length,
+      birds: stored.birds,
+    });
   } catch (err) {
-    console.error("Ticklist error:", err.message);
-    res.status(500).json({ error: "Failed to fetch tick list", detail: err.message });
+    console.error("Ticklist read failed:", err.message);
+    res.status(500).json({ error: "Failed to read tick list", detail: err.message });
   }
 });
 
@@ -223,58 +108,31 @@ const ticked = $(cells[1]).text().trim() === "X";
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
-const embeddingQueue = new Set();
-let embeddingRunning = false;
-async function scheduleEmbedding(date) {
-  if (!db.isEnabled() || !embeddings.isConfigured()) return;
-  embeddingQueue.add(date);
-  if (embeddingRunning) return;
-  embeddingRunning = true;
+// DB-only reader. No scraping; returns whatever Postgres currently has for
+// the date (empty payload if nothing seeded yet).
+async function readObservationsForDate(date) {
+  const effectiveDate = date || todayStr();
+  if (!db.isEnabled()) {
+    return { date: effectiveDate, count: 0, observations: [] };
+  }
   try {
-    while (embeddingQueue.size) {
-      const next = embeddingQueue.values().next().value;
-      embeddingQueue.delete(next);
-      try {
-        const n = await db.embedMissingForDate(next, embeddings.embedBatch, embeddings.pgvectorLiteral);
-        if (n) console.log(`🧮 embedded ${n} obs for ${next}`);
-      } catch (e) {
-        console.error(`embedding failed for ${next}:`, e.message);
-      }
-    }
-  } finally {
-    embeddingRunning = false;
+    const rows = await db.getObservationsByDate(effectiveDate);
+    return { date: effectiveDate, count: rows.length, observations: rows };
+  } catch (err) {
+    console.error("DB obs read failed:", err.message);
+    return { date: effectiveDate, count: 0, observations: [] };
   }
 }
 
-async function fetchObservationsForDate(date) {
+// Network refresher: scrape dofbasen for the given date and upsert.
+// Only called from the notification poller, the boot prewarm, and the
+// backfill seeder — never from a user-facing request.
+async function refreshObservationsForDate(date) {
   const isToday = !date || date === todayStr();
   const effectiveDate = date || todayStr();
-  const cacheKey = `obs-all-${date || "today"}`;
-  const ttl = isToday ? OBS_CACHE_TTL : 24 * 60 * 60 * 1000;
-  const cached = getCached(cacheKey, ttl);
-  if (cached) return cached;
+  const dedupeKey = `refresh-obs-${effectiveDate}`;
 
-  if (!isToday && db.isEnabled()) {
-    try {
-      const log = await db.getScrapeAge(effectiveDate);
-      if (log) {
-        const rows = await db.getObservationsByDate(effectiveDate);
-        if (rows.length) {
-          const data = { date: effectiveDate, count: rows.length, observations: rows };
-          setCache(cacheKey, data);
-          scheduleEmbedding(effectiveDate).catch(() => {});
-          return data;
-        }
-      }
-    } catch (err) {
-      console.error("DB obs read failed:", err.message);
-    }
-  }
-
-  return dedupe(cacheKey, async () => {
-    const cachedAfterWait = getCached(cacheKey, ttl);
-    if (cachedAfterWait) return cachedAfterWait;
-
+  return dedupe(dedupeKey, async () => {
     let response;
     if (isToday) {
       response = await fetch("https://dofbasen.dk/observationer/");
@@ -287,13 +145,12 @@ async function fetchObservationsForDate(date) {
       });
     }
     if (!response.ok) throw new Error(`DOFbasen returned ${response.status}`);
-    const data = await parseObservationsHtml(response, effectiveDate, cacheKey);
+    const data = await parseObservationsHtml(response, effectiveDate);
 
     if (db.isEnabled() && data?.observations?.length) {
       db.upsertObservations(effectiveDate, data.observations)
         .then((n) => {
           if (n) console.log(`💾 stored ${n} new obs for ${effectiveDate}`);
-          return scheduleEmbedding(effectiveDate);
         })
         .catch((e) => console.error("DB obs upsert failed:", e.message));
     }
@@ -304,15 +161,15 @@ async function fetchObservationsForDate(date) {
 app.get("/api/observations", async (req, res) => {
   const date = DATE_RE.test(req.query.date || "") ? req.query.date : null;
   try {
-    const data = await fetchObservationsForDate(date);
+    const data = await readObservationsForDate(date);
     res.json(data);
   } catch (err) {
     console.error("Observations error:", err.message);
-    res.status(500).json({ error: "Failed to fetch observations", detail: err.message });
+    res.status(500).json({ error: "Failed to read observations", detail: err.message });
   }
 });
 
-async function parseObservationsHtml(response, dateLabel, cacheKey) {
+async function parseObservationsHtml(response, dateLabel) {
   try {
 
     // DOFbasen uses ISO-8859-1
@@ -435,23 +292,26 @@ async function parseObservationsHtml(response, dateLabel, cacheKey) {
       });
     }
 
-    // Resolve coordinates for observations missing them via locality lookup
+    // Resolve missing coords from previously-seen observations in the DB before
+    // falling back to dofbasen poplok.php. This whole code path only runs
+    // inside the network-allowed refresher, so the dofbasen fallback is OK.
     const needLoknrs = [...new Set(
       observations.filter(o => o.lat == null && o.loknr).map(o => o.loknr)
     )];
 
     if (needLoknrs.length > 0) {
-      const lokResults = {};
-      // Fetch in parallel batches of 20 to be polite
-      for (let i = 0; i < needLoknrs.length; i += 20) {
-        const batch = needLoknrs.slice(i, i + 20);
+      let lokResults = {};
+      if (db.isEnabled()) {
+        try { lokResults = await db.getLocalityCoords(needLoknrs); }
+        catch (e) { console.error("locality DB lookup failed:", e.message); }
+      }
+      const stillMissing = needLoknrs.filter(
+        (id) => !lokResults[id] || lokResults[id].lat == null
+      );
+
+      for (let i = 0; i < stillMissing.length; i += 20) {
+        const batch = stillMissing.slice(i, i + 20);
         await Promise.all(batch.map(async (loknr) => {
-          const lokCacheKey = `lok-${loknr}`;
-          const lokCached = getCached(lokCacheKey, 24 * 60 * 60 * 1000);
-          if (lokCached) {
-            lokResults[loknr] = lokCached;
-            return;
-          }
           try {
             const lokUrl = `https://dofbasen.dk/poplok.php?loknr=${loknr}`;
             const lokRes = await fetch(lokUrl);
@@ -460,16 +320,17 @@ async function parseObservationsHtml(response, dateLabel, cacheKey) {
             const $lok = cheerio.load(lokHtml);
             const lonVal = parseFloat($lok("#lok_center_lon").text());
             const latVal = parseFloat($lok("#lok_center_lat").text());
-            const lokData = { lat: isNaN(lonVal) ? null : lonVal, lng: isNaN(latVal) ? null : latVal };
-            setCache(lokCacheKey, lokData);
-            lokResults[loknr] = lokData;
+            lokResults[loknr] = {
+              loknr,
+              lat: isNaN(lonVal) ? null : lonVal,
+              lng: isNaN(latVal) ? null : latVal,
+            };
           } catch {
-            lokResults[loknr] = { lat: null, lng: null };
+            lokResults[loknr] = { loknr, lat: null, lng: null };
           }
         }));
       }
 
-      // Apply resolved coords
       for (const obs of observations) {
         if (obs.lat == null && obs.loknr && lokResults[obs.loknr]) {
           obs.lat = lokResults[obs.loknr].lat;
@@ -478,14 +339,11 @@ async function parseObservationsHtml(response, dateLabel, cacheKey) {
       }
     }
 
-    const data = {
+    return {
       date: dateLabel,
       count: observations.length,
       observations,
     };
-
-    setCache(cacheKey, data);
-    return data;
   } catch (err) {
     console.error("Observations parse error:", err.message);
     throw err;
@@ -493,71 +351,33 @@ async function parseObservationsHtml(response, dateLabel, cacheKey) {
 }
 
 // ─── Locality Coordinates Endpoint ────────────────────────────────────
-const LOK_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
-
+// Coords are derived from observations stored in the DB. Cold loknrs (never
+// observed) return null/null; they get filled once an obs with that loknr
+// flows through the next notification refresh.
 app.get("/api/locality/:loknr", async (req, res) => {
   const { loknr } = req.params;
-  const cacheKey = `lok-${loknr}`;
-  const cached = getCached(cacheKey, LOK_CACHE_TTL);
-  if (cached) return res.json(cached);
-
+  if (!db.isEnabled()) return res.json({ loknr, lat: null, lng: null });
   try {
-    const url = `https://dofbasen.dk/poplok.php?loknr=${loknr}`;
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`DOFbasen returned ${response.status}`);
-
-    const buffer = await response.arrayBuffer();
-    const html = iconv.decode(Buffer.from(buffer), "iso-8859-1");
-
-    // Extract coords: <span id="lok_center_lon">55.923598</span>/<span id="lok_center_lat">12.314231</span>
-    // Note: DOFbasen labels are swapped — "lon" contains latitude, "lat" contains longitude
-    const $ = cheerio.load(html);
-    const lonVal = parseFloat($("#lok_center_lon").text());
-    const latVal = parseFloat($("#lok_center_lat").text());
-
-    if (isNaN(lonVal) || isNaN(latVal)) {
-      return res.json({ loknr, lat: null, lng: null });
-    }
-
-    // DOFbasen has lon/lat labels swapped in the HTML
-    const data = { loknr, lat: lonVal, lng: latVal };
-    setCache(cacheKey, data);
-    res.json(data);
+    const map = await db.getLocalityCoords([loknr]);
+    res.json(map[loknr] || { loknr, lat: null, lng: null });
   } catch (err) {
     console.error("Locality error:", err.message);
-    res.status(500).json({ error: "Failed to fetch locality", detail: err.message });
+    res.status(500).json({ error: "Failed to read locality", detail: err.message });
   }
 });
 
-// ─── Full Species List (DOFbasen art IDs) ────────────────────────────────────
-const SPECIES_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
-
+// ─── Species List (Danish name → artId, derived from observations) ───────────
+// Only covers species ever seen in the local DB. Sufficient for UI lookups
+// against birds the user is tracking; cold (never-observed) species return
+// no mapping until they show up in an observation.
 app.get("/api/species-map", async (req, res) => {
-  const cacheKey = "species-map";
-  const cached = getCached(cacheKey, SPECIES_CACHE_TTL);
-  if (cached) return res.json(cached);
-
+  if (!db.isEnabled()) return res.json({ count: 0, byName: {} });
   try {
-    const response = await fetch(
-      "https://service.dofbasen.dk/DanmarksFugleBackend/api/home/alphabetically"
-    );
-    if (!response.ok) throw new Error(`DOFbasen species API returned ${response.status}`);
-
-    const list = await response.json();
-    // Build map: lowercased Danish name -> artId
-    const byName = {};
-    for (const item of list) {
-      if (item.label && item.value && item.value !== "xxxxx") {
-        byName[item.label.toLowerCase().trim()] = item.value;
-      }
-    }
-
-    const data = { count: Object.keys(byName).length, byName };
-    setCache(cacheKey, data);
-    res.json(data);
+    const byName = await db.getSpeciesMapFromObservations();
+    res.json({ count: Object.keys(byName).length, byName });
   } catch (err) {
     console.error("Species map error:", err.message);
-    res.status(500).json({ error: "Failed to fetch species map", detail: err.message });
+    res.status(500).json({ error: "Failed to read species map", detail: err.message });
   }
 });
 
@@ -567,40 +387,22 @@ app.get("/api/localities", async (req, res) => {
   if (!ids) return res.status(400).json({ error: "ids parameter required (comma-separated loknr)" });
 
   const loknrs = ids.split(",").filter(Boolean).slice(0, 50); // max 50
-  const results = {};
+  if (!db.isEnabled()) {
+    const empty = {};
+    for (const id of loknrs) empty[id] = { loknr: id, lat: null, lng: null };
+    return res.json(empty);
+  }
 
-  await Promise.all(
-    loknrs.map(async (loknr) => {
-      const cacheKey = `lok-${loknr}`;
-      const cached = getCached(cacheKey, LOK_CACHE_TTL);
-      if (cached) {
-        results[loknr] = cached;
-        return;
-      }
-
-      try {
-        const url = `https://dofbasen.dk/poplok.php?loknr=${loknr}`;
-        const response = await fetch(url);
-        const buffer = await response.arrayBuffer();
-        const html = iconv.decode(Buffer.from(buffer), "iso-8859-1");
-        const $ = cheerio.load(html);
-        const lonVal = parseFloat($("#lok_center_lon").text());
-        const latVal = parseFloat($("#lok_center_lat").text());
-
-        const data = { loknr, lat: isNaN(lonVal) ? null : lonVal, lng: isNaN(latVal) ? null : latVal };
-        setCache(cacheKey, data);
-        results[loknr] = data;
-      } catch {
-        results[loknr] = { loknr, lat: null, lng: null };
-      }
-    })
-  );
-
-  res.json(results);
+  try {
+    const results = await db.getLocalityCoords(loknrs);
+    res.json(results);
+  } catch (err) {
+    console.error("Localities error:", err.message);
+    res.status(500).json({ error: "Failed to read localities", detail: err.message });
+  }
 });
 
 // ─── AI Predictions Endpoint ──────────────────────────────────────────
-const AI_CACHE_TTL = 60 * 60 * 1000; // 1h
 const FOUNDRY_ENDPOINT = process.env.AZURE_FOUNDRY_ENDPOINT || "";
 const FOUNDRY_KEY = process.env.AZURE_FOUNDRY_KEY || "";
 const FOUNDRY_DEPLOYMENT = process.env.AZURE_FOUNDRY_DEPLOYMENT || "";
@@ -618,20 +420,12 @@ function distanceKm(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-function dateNDaysAgo(n) {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
-}
-
-function dateOneYearAgo(dateStr) {
-  const [y, m, dd] = dateStr.split("-").map(Number);
-  return `${y - 1}-${String(m).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
-}
-
 app.get("/api/ai-predictions", async (req, res) => {
   if (!FOUNDRY_ENDPOINT || !FOUNDRY_KEY || !FOUNDRY_DEPLOYMENT) {
     return res.status(503).json({ error: "AI not configured. Set AZURE_FOUNDRY_ENDPOINT, AZURE_FOUNDRY_KEY, AZURE_FOUNDRY_DEPLOYMENT." });
+  }
+  if (!db.isEnabled()) {
+    return res.status(503).json({ error: "DB not configured. Predictor requires Postgres." });
   }
 
   const userId = req.query.userId;
@@ -642,107 +436,76 @@ app.get("/api/ai-predictions", async (req, res) => {
     return res.status(400).json({ error: "userId, lat, lng required" });
   }
 
-  const cacheKey = `ai-${userId}-${listType}-${Math.round(lat * 10) / 10}-${Math.round(lng * 10) / 10}`;
-  const cached = getCached(cacheKey, AI_CACHE_TTL);
-  if (cached) return res.json(cached);
-
   try {
     const tickList = await fetchTickListData(userId, listType);
     if (!tickList?.birds?.length) {
       return res.status(404).json({ error: "tickList not found" });
     }
 
-    const missing = new Map();
-    for (const b of tickList.birds) {
-      if (!b.ticked && b.latin) missing.set(b.latin.toLowerCase(), b);
+    const missingBirds = tickList.birds.filter((b) => !b.ticked && b.latin);
+    if (missingBirds.length === 0) {
+      return res.json({ generatedAt: new Date().toISOString(), predictions: [], note: "Ingen manglende arter" });
     }
 
-    // Reduced from 7 to 3 days. Each day = full DOFbasen scrape + locality
-    // lookups (~9s cold). 7+7 days exceeded Azure's 230s gateway timeout.
-    const dates = [];
-    for (let i = 0; i < 3; i++) dates.push(dateNDaysAgo(i));
-    const yearAgoDates = dates.map(dateOneYearAgo);
+    const ranked = await predictor.rankForDay({
+      lat,
+      lng,
+      missingBirds,
+      today: new Date(),
+    });
 
-    // Limit concurrency to avoid OOM on small App Service plans.
-    // Cheerio parsing of the full DOFbasen HTML is memory-heavy; 14 in parallel
-    // exhausts Node's default heap on B1.
-    async function mapLimit(items, limit, fn) {
-      const out = new Array(items.length);
-      let idx = 0;
-      const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (idx < items.length) {
-          const i = idx++;
-          out[i] = await fn(items[i]).catch(() => null);
-        }
-      });
-      await Promise.all(workers);
-      return out;
-    }
-
-    const recent = await mapLimit(dates, 3, fetchObservationsForDate);
-    const lastYear = await mapLimit(yearAgoDates, 3, fetchObservationsForDate);
-
-    const filterRelevant = (daysList) => {
-      const out = [];
-      for (const day of daysList) {
-        if (!day?.observations) continue;
-        for (const obs of day.observations) {
-          if (!obs.latin) continue;
-          if (!missing.has(obs.latin.toLowerCase())) continue;
-          const dist = distanceKm(lat, lng, obs.lat, obs.lng);
-          out.push({
-            species: obs.species,
-            latin: obs.latin,
-            date: day.date,
-            location: obs.location,
-            count: obs.count,
-            distanceKm: dist == null ? null : Math.round(dist * 10) / 10,
-            time: obs.time,
-            rare: obs.rare,
-          });
-        }
-      }
-      return out;
-    };
-
-    const recentRelevant = filterRelevant(recent);
-    const lastYearRelevant = filterRelevant(lastYear);
-
-    const speciesStats = new Map();
-    for (const obs of recentRelevant) {
-      const cur = speciesStats.get(obs.latin) || { count: 0 };
-      cur.count += 1;
-      speciesStats.set(obs.latin, cur);
-    }
-    const topSpecies = [...speciesStats.entries()]
-      .sort((a, b) => b[1].count - a[1].count)
-      .slice(0, 10)
-      .map(([latin]) => latin);
-
-    if (topSpecies.length === 0) {
-      const empty = {
+    if (!ranked.items.length) {
+      return res.json({
         generatedAt: new Date().toISOString(),
         predictions: [],
-        note: "Ingen relevante observationer for manglende arter",
-      };
-      setCache(cacheKey, empty);
-      return res.json(empty);
+        note: "Ingen historiske observationer for manglende arter i denne tid af året",
+      });
     }
 
-    const speciesSet = new Set(topSpecies);
-    const trim = (list) => list.filter((o) => speciesSet.has(o.latin));
+    const latinToName = new Map();
+    for (const b of tickList.birds) {
+      if (b.latin) latinToName.set(b.latin.toLowerCase(), b.name);
+    }
+
+    const nextDates = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() + i);
+      nextDates.push(d.toISOString().slice(0, 10));
+    }
 
     const systemPrompt =
-      "Du er en ekspert ornitolog og analytiker. Brugeren mangler at krydse en række fuglearter af. Givet observationsdata fra hele Danmark (de seneste 7 dage og samme uge sidste år), forudsig hvor og hvornår brugeren har bedst chance for at se de manglende arter de næste dage. Brug mønstre fra historikken. Svar kun med struktureret JSON, på dansk.";
+      "Du er ornitolog. Brugeren mangler at krydse arter af. " +
+      "Du modtager en liste af kandidater hvor hver kandidat har et lokalitetsområde og evidens (faktiske historiske observationer fra DOFbasen). " +
+      "Skriv kort dansk reasoning der ALENE er baseret på den givne evidens — opfind ikke lokaliteter, datoer eller observationer der ikke findes i evidens. " +
+      "Brug danske fuglenavne. Brug feltet 'tillidsbånd' direkte som confidence (lav/mellem/høj). " +
+      "Til suggestedDates: vælg 1-3 datoer fra listen 'mulige_datoer' baseret på årstid og evidens. Svar kun struktureret JSON.";
 
     const userPayload = {
       brugerLokation: { lat, lng },
-      manglendeArter: topSpecies.map((latin) => ({
-        latin,
-        navn: missing.get(latin.toLowerCase())?.name,
+      mulige_datoer: nextDates,
+      kandidater: ranked.items.map((it) => ({
+        latin: it.latin,
+        navn: latinToName.get(it.latin.toLowerCase()) || it.species,
+        omraade: {
+          navn: it.cluster.name,
+          loknr: it.cluster.loknr,
+          naerliggende: it.cluster.nearby.map((n) => ({
+            lokalitet: n.location,
+            loknr: n.loknr,
+            distKm: n.distKm,
+          })),
+        },
+        tillidsbånd: it.band,
+        score: Math.round(it.scoreNorm * 100) / 100,
+        evidens: it.evidence.map((e) => ({
+          date: e.date,
+          lokalitet: e.location,
+          antal: e.count,
+          observatør: e.observer,
+          adfærd: e.behaviour,
+        })),
       })),
-      sidsteUge: trim(recentRelevant),
-      sammeUgeSidsteAar: trim(lastYearRelevant),
     };
 
     const responseFormat = {
@@ -788,7 +551,7 @@ app.get("/api/ai-predictions", async (req, res) => {
         { role: "user", content: JSON.stringify(userPayload) },
       ],
       response_format: responseFormat,
-      temperature: 0.4,
+      temperature: 0.2,
     };
     if (isV1) requestBody.model = FOUNDRY_DEPLOYMENT;
 
@@ -811,12 +574,10 @@ app.get("/api/ai-predictions", async (req, res) => {
     if (!content) throw new Error("Empty AI response");
     const parsed = JSON.parse(content);
 
-    const data = {
+    res.json({
       generatedAt: new Date().toISOString(),
       predictions: parsed.predictions || [],
-    };
-    setCache(cacheKey, data);
-    res.json(data);
+    });
   } catch (err) {
     console.error("AI predictions error:", err.message);
     res.status(500).json({ error: "Failed to generate predictions", detail: err.message });
@@ -827,38 +588,21 @@ app.get("/api/ai-predictions", async (req, res) => {
 // Returns monthly recommendations grouped by location: where to go in a
 // given upcoming month to tick missing species, based on observations from
 // the same month last year.
-const CAL_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h — monthly view changes slowly
-
-function lastYearMonthSampleDates(monthStr) {
-  const m = /^(\d{4})-(\d{2})$/.exec(monthStr);
-  if (!m) return [];
-  const year = parseInt(m[1], 10) - 1;
-  const month = parseInt(m[2], 10);
-  const daysInMonth = new Date(year, month, 0).getDate();
-  const out = [];
-  for (let d = 1; d <= daysInMonth; d += 5) {
-    out.push(`${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
-  }
-  return out;
-}
 
 app.get("/api/ai-calendar", async (req, res) => {
   if (!FOUNDRY_ENDPOINT || !FOUNDRY_KEY || !FOUNDRY_DEPLOYMENT) {
     return res.status(503).json({ error: "AI not configured. Set AZURE_FOUNDRY_ENDPOINT, AZURE_FOUNDRY_KEY, AZURE_FOUNDRY_DEPLOYMENT." });
   }
+  if (!db.isEnabled()) {
+    return res.status(503).json({ error: "DB not configured. Predictor requires Postgres." });
+  }
 
   const userId = req.query.userId;
   const listType = req.query.listType || "1";
-  const lat = parseFloat(req.query.lat);
-  const lng = parseFloat(req.query.lng);
   const month = req.query.month;
-  if (!userId || isNaN(lat) || isNaN(lng) || !/^\d{4}-\d{2}$/.test(month || "")) {
-    return res.status(400).json({ error: "userId, lat, lng, month (YYYY-MM) required" });
+  if (!userId || !/^\d{4}-\d{2}$/.test(month || "")) {
+    return res.status(400).json({ error: "userId, month (YYYY-MM) required" });
   }
-
-  const cacheKey = `ai-cal-${userId}-${listType}-${Math.round(lat * 10) / 10}-${Math.round(lng * 10) / 10}-${month}`;
-  const cached = getCached(cacheKey, CAL_CACHE_TTL);
-  if (cached) return res.json(cached);
 
   try {
     const tickList = await fetchTickListData(userId, listType);
@@ -866,141 +610,62 @@ app.get("/api/ai-calendar", async (req, res) => {
       return res.status(404).json({ error: "tickList not found" });
     }
 
-    const missing = new Map();
+    const missingBirds = tickList.birds.filter((b) => !b.ticked && b.latin);
     const nameToLatin = new Map();
     for (const b of tickList.birds) {
       if (b.latin && b.name) nameToLatin.set(b.name.toLowerCase(), b.latin);
-      if (!b.ticked && b.latin) missing.set(b.latin.toLowerCase(), b);
     }
 
-    const sampleDates = lastYearMonthSampleDates(month);
-    if (sampleDates.length === 0) {
-      return res.status(400).json({ error: "invalid month" });
-    }
+    const ranked = await predictor.rankForCalendar({ month, missingBirds });
 
-    async function mapLimit(items, limit, fn) {
-      const out = new Array(items.length);
-      let idx = 0;
-      const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (idx < items.length) {
-          const i = idx++;
-          out[i] = await fn(items[i]).catch(() => null);
-        }
-      });
-      await Promise.all(workers);
-      return out;
-    }
-
-    let relevant = [];
-
-    if (db.isEnabled()) {
-      try {
-        const prevYear = parseInt(month.slice(0, 4), 10) - 1;
-        const monthNum = parseInt(month.slice(5, 7), 10);
-        const haveScrapes = await db.getDatesWithScrape(
-          sampleDates[0], sampleDates[sampleDates.length - 1]
-        );
-        const missingDates = sampleDates.filter((d) => !haveScrapes.has(d));
-        if (missingDates.length) {
-          await mapLimit(missingDates, 5, fetchObservationsForDate);
-        }
-        const fromDb = await db.getRelevantObsForMonth({
-          year: prevYear,
-          month: monthNum,
-          latinList: [...missing.keys()],
-        });
-        relevant = fromDb.map((o) => ({
-          species: o.species,
-          latin: o.latin,
-          date: o.date,
-          location: o.location,
-          loknr: o.loknr,
-          count: o.count,
-          rare: o.rare,
-        }));
-      } catch (err) {
-        console.error("AI calendar DB path failed, falling back to scrape:", err.message);
-      }
-    }
-
-    if (relevant.length === 0) {
-      const days = await mapLimit(sampleDates, 5, fetchObservationsForDate);
-      for (const day of days) {
-        if (!day?.observations) continue;
-        for (const obs of day.observations) {
-          if (!obs.latin) continue;
-          if (!missing.has(obs.latin.toLowerCase())) continue;
-          relevant.push({
-            species: obs.species,
-            latin: obs.latin,
-            date: day.date,
-            location: obs.location,
-            loknr: obs.loknr,
-            count: obs.count,
-            rare: obs.rare,
-          });
-        }
-      }
-    }
-
-    const speciesStats = new Map();
-    for (const obs of relevant) {
-      const cur = speciesStats.get(obs.latin) || { count: 0 };
-      cur.count += 1;
-      speciesStats.set(obs.latin, cur);
-    }
-    const topSpecies = [...speciesStats.entries()]
-      .sort((a, b) => b[1].count - a[1].count)
-      .slice(0, 6)
-      .map(([latin]) => latin);
-
-    if (topSpecies.length === 0) {
-      const empty = {
+    if (!ranked.items.length) {
+      return res.json({
         generatedAt: new Date().toISOString(),
         month,
         locations: [],
-        note: "Ingen relevante observationer for manglende arter i denne måned sidste år",
-      };
-      setCache(cacheKey, empty);
-      return res.json(empty);
-    }
-
-    const speciesSet = new Set(topSpecies);
-    const bySpecies = new Map();
-    for (const o of relevant) {
-      if (!speciesSet.has(o.latin)) continue;
-      if (!bySpecies.has(o.latin)) bySpecies.set(o.latin, []);
-      bySpecies.get(o.latin).push(o);
-    }
-    const trimmed = [];
-    for (const [, list] of bySpecies) {
-      list.sort((a, b) => (b.count || 0) - (a.count || 0));
-      trimmed.push(...list.slice(0, 5));
+        note: "Ingen relevante observationer for manglende arter i denne måned",
+      });
     }
 
     const monthNamesDa = ["januar","februar","marts","april","maj","juni","juli","august","september","oktober","november","december"];
     const targetMonthName = monthNamesDa[parseInt(month.slice(5,7),10) - 1];
 
     const systemPrompt =
-      "Du er en ekspert ornitolog. Brugeren planlægger fugleture og mangler at krydse en række arter af. " +
-      "Givet observationer fra samme måned sidste år, anbefal de bedste lokaliteter i Danmark at besøge i den kommende måned — afstand er ikke en begrænsning, brugeren planlægger ture. " +
-      "Gruppér anbefalinger pr. LOKALITET, ikke pr. art — hvert lokalitets-objekt skal liste de manglende arter brugeren har god chance for at se dér. " +
-      "Sortér lokaliteter så dem hvor brugeren kan krydse flest manglende arter af kommer først. " +
-      "Brug danske fuglenavne, ikke latinske. " +
-      "Skriv kort dansk reasoning pr. art og pr. lokalitet. Svar kun med struktureret JSON.";
+      "Du er ornitolog. Brugeren planlægger fugleture i den kommende måned og mangler at krydse arter af. " +
+      "Du modtager en liste af lokalitetsområder med tilknyttede arter og evidens (faktiske historiske observationer). " +
+      "Skriv kort dansk reasoning ALENE baseret på evidens — opfind ikke lokaliteter, datoer eller observationer. " +
+      "Brug danske fuglenavne. Brug feltet 'tillidsbånd' direkte som confidence (lav/mellem/høj). " +
+      "Skriv også en kort summary pr. område. " +
+      "Returnér områderne i samme rækkefølge som inputtet (sorteret efter antal manglende arter, dernæst score). " +
+      "Svar kun med struktureret JSON.";
+
+    const latinToName = new Map();
+    for (const b of tickList.birds) {
+      if (b.latin) latinToName.set(b.latin.toLowerCase(), b.name);
+    }
 
     const userPayload = {
-      brugerLokation: { lat, lng },
       maalMaaned: month,
       maalMaanedNavn: targetMonthName,
-      manglendeArter: topSpecies.map((latin) => missing.get(latin.toLowerCase())?.name).filter(Boolean),
-      observationerSammeMaanedSidsteAar: trimmed.map((o) => ({
-        art: o.species,
-        date: o.date,
-        location: o.location,
-        loknr: o.loknr,
-        count: o.count,
-        rare: o.rare,
+      omraader: ranked.items.map((it) => ({
+        navn: it.cluster.name,
+        loknr: it.cluster.loknr,
+        naerliggende: it.cluster.nearby.map((n) => ({
+          lokalitet: n.location,
+          loknr: n.loknr,
+          distKm: n.distKm,
+        })),
+        arter: it.species.map((s) => ({
+          latin: s.latin,
+          navn: latinToName.get(s.latin.toLowerCase()) || s.species,
+          tillidsbånd: s.band,
+          evidens: s.evidence.map((e) => ({
+            date: e.date,
+            lokalitet: e.location,
+            antal: e.count,
+            adfærd: e.behaviour,
+          })),
+        })),
       })),
     };
 
@@ -1056,7 +721,7 @@ app.get("/api/ai-calendar", async (req, res) => {
         { role: "user", content: JSON.stringify(userPayload) },
       ],
       response_format: responseFormat,
-      temperature: 0.4,
+      temperature: 0.2,
     };
     if (isV1) requestBody.model = FOUNDRY_DEPLOYMENT;
 
@@ -1087,16 +752,311 @@ app.get("/api/ai-calendar", async (req, res) => {
       })),
     }));
 
-    const data = {
+    res.json({
       generatedAt: new Date().toISOString(),
       month,
       locations,
-    };
-    setCache(cacheKey, data);
-    res.json(data);
+    });
   } catch (err) {
     console.error("AI calendar error:", err.message);
     res.status(500).json({ error: "Failed to generate calendar", detail: err.message });
+  }
+});
+
+// ─── Raw predictor dataset (pre-LLM) ──────────────────────────────────
+// Returns the ranked candidate set that the AI endpoints feed to the LLM,
+// without calling the LLM. Useful for inspecting what the ML pipeline
+// produces before summarisation.
+app.get("/api/predictor-dataset", async (req, res) => {
+  if (!db.isEnabled()) {
+    return res.status(503).json({ error: "DB not configured. Predictor requires Postgres." });
+  }
+  const userId = req.query.userId;
+  const listType = req.query.listType || "1";
+  const mode = req.query.mode === "calendar" ? "calendar" : "day";
+  const lat = parseFloat(req.query.lat);
+  const lng = parseFloat(req.query.lng);
+  const month = req.query.month;
+
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (mode === "day" && (isNaN(lat) || isNaN(lng))) {
+    return res.status(400).json({ error: "lat, lng required for mode=day" });
+  }
+  if (mode === "calendar" && !/^\d{4}-\d{2}$/.test(month || "")) {
+    return res.status(400).json({ error: "month (YYYY-MM) required for mode=calendar" });
+  }
+
+  const t0 = performance.now();
+  const timings = {};
+  try {
+    const tTick = performance.now();
+    const tickList = await fetchTickListData(userId, listType);
+    timings.tick = Math.round(performance.now() - tTick);
+    if (!tickList?.birds?.length) {
+      return res.status(404).json({ error: "tickList not found" });
+    }
+    const missingBirds = tickList.birds.filter((b) => !b.ticked && b.latin);
+    const latinToName = new Map();
+    for (const b of tickList.birds) {
+      if (b.latin) latinToName.set(b.latin.toLowerCase(), b.name);
+    }
+
+    const ranked = mode === "day"
+      ? await predictor.rankForDay({ lat, lng, missingBirds, today: new Date(), timings })
+      : await predictor.rankForCalendar({ month, missingBirds });
+
+    const decorate = (latin, species) => ({
+      latin,
+      species,
+      name: latinToName.get((latin || "").toLowerCase()) || species,
+    });
+
+    let candidates = [];
+    if (mode === "day") {
+      candidates = ranked.items.map((it) => {
+        const d = decorate(it.latin, it.species);
+        return {
+          ...d,
+          score: it.score,
+          scoreNorm: it.scoreNorm,
+          band: it.band,
+          cluster: it.cluster,
+          evidence: it.evidence,
+        };
+      });
+    } else {
+      candidates = ranked.items.map((it) => ({
+        cluster: it.cluster,
+        score: it.score,
+        species: it.species.map((s) => ({
+          ...decorate(s.latin, s.species),
+          score: s.score,
+          scoreNorm: s.scoreNorm,
+          band: s.band,
+          evidence: s.evidence,
+        })),
+      }));
+    }
+
+    timings.total = Math.round(performance.now() - t0);
+    const parts = Object.entries(timings)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(" ");
+    console.log(`predictor-dataset userId=${userId} mode=${mode} ${parts}`);
+    res.setHeader(
+      "Server-Timing",
+      Object.entries(timings)
+        .map(([k, v]) => `${k};dur=${v}`)
+        .join(", ")
+    );
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      mode,
+      month: mode === "calendar" ? month : undefined,
+      candidates,
+    });
+  } catch (err) {
+    console.error("Predictor dataset error:", err.message);
+    res.status(500).json({ error: "Failed to build predictor dataset", detail: err.message });
+  }
+});
+
+// ─── AI Chat (ornithologist) ──────────────────────────────────────────
+// Stateful, per-device chat. The LLM can call tools that read the local
+// observations/ticklist/predictor data. History persists in chat_messages
+// keyed by deviceId (client-generated UUID).
+
+const CHAT_MAX_TURNS = 6;
+const CHAT_HISTORY_LIMIT = 40;
+
+function foundryApiUrl() {
+  const endpoint = FOUNDRY_ENDPOINT.replace(/\/$/, "");
+  const isV1 = /\/openai\/v1$/.test(endpoint);
+  return {
+    isV1,
+    url: isV1
+      ? `${endpoint}/chat/completions`
+      : `${endpoint}/openai/deployments/${FOUNDRY_DEPLOYMENT}/chat/completions?api-version=${FOUNDRY_API_VERSION}`,
+  };
+}
+
+function historyToMessages(history) {
+  const out = [];
+  for (const m of history) {
+    if (m.role === "user" || m.role === "system") {
+      out.push({ role: m.role, content: m.content || "" });
+    } else if (m.role === "assistant") {
+      const msg = { role: "assistant", content: m.content || "" };
+      if (m.toolCalls) msg.tool_calls = m.toolCalls;
+      out.push(msg);
+    } else if (m.role === "tool") {
+      out.push({
+        role: "tool",
+        tool_call_id: m.toolCallId,
+        name: m.toolName,
+        content: m.content || "",
+      });
+    }
+  }
+  return out;
+}
+
+const CHAT_SYSTEM_PROMPT =
+  "Du er en erfaren dansk ornitolog, der hjælper en birder med at krydse manglende arter på Netfugl. " +
+  "Brugeren har en krydsliste, en seneste position, og du har adgang til lokale data fra DOFbasen via værktøjer. " +
+  "Brug værktøjerne aktivt for at hente konkrete observationer, lokaliteter og predictor-data — opfind ALDRIG datoer, lokaliteter eller observationer. " +
+  "Hvis du mangler kontekst (fx hvilke arter brugeren mangler), så start med get_ticklist_summary eller get_predictor_dataset. " +
+  "Når brugeren spørger om en bestemt art (kendetegn, levested, føde, bestand, beskyttelse) — kald lookup_species_facts. " +
+  "Hvis lookup_species_facts returnerer et 'image'-felt, så vis billedet i svaret via markdown-syntaksen ![navn](sti). " +
+  "Brug danske fuglenavne i svar. Skriv kort, præcist og handlingsorienteret på dansk. " +
+  "Når du anbefaler ture, så referér til den underliggende evidens (dato, lokalitet, antal).";
+
+app.post("/api/ai-chat", async (req, res) => {
+  if (!FOUNDRY_ENDPOINT || !FOUNDRY_KEY || !FOUNDRY_DEPLOYMENT) {
+    return res.status(503).json({ error: "AI not configured." });
+  }
+  if (!db.isEnabled()) {
+    return res.status(503).json({ error: "DB not configured." });
+  }
+
+  const { deviceId, userId, listType = "1", lat, lng, message } = req.body || {};
+  if (!deviceId || typeof deviceId !== "string") {
+    return res.status(400).json({ error: "deviceId required" });
+  }
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "message required" });
+  }
+
+  try {
+    const tickList = userId
+      ? await fetchTickListData(userId, listType).catch(() => null)
+      : null;
+    const ctx = {
+      tickList,
+      lat: typeof lat === "number" ? lat : parseFloat(lat),
+      lng: typeof lng === "number" ? lng : parseFloat(lng),
+      userId,
+      listType,
+    };
+    if (Number.isNaN(ctx.lat)) ctx.lat = null;
+    if (Number.isNaN(ctx.lng)) ctx.lng = null;
+
+    const history = await db.getChatHistory(deviceId, CHAT_HISTORY_LIMIT);
+    await db.insertChatMessage({ deviceId, userId, listType, role: "user", content: message });
+
+    const messages = [
+      { role: "system", content: CHAT_SYSTEM_PROMPT },
+      ...historyToMessages(history),
+      { role: "user", content: message },
+    ];
+
+    const { isV1, url } = foundryApiUrl();
+    const toolTrace = [];
+    let finalContent = null;
+
+    for (let turn = 0; turn < CHAT_MAX_TURNS; turn++) {
+      const requestBody = {
+        messages,
+        tools: chatTools.TOOL_SCHEMAS,
+        temperature: 0.2,
+      };
+      if (isV1) requestBody.model = FOUNDRY_DEPLOYMENT;
+
+      const aiRes = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "api-key": FOUNDRY_KEY,
+          Authorization: `Bearer ${FOUNDRY_KEY}`,
+        },
+        body: JSON.stringify(requestBody),
+      });
+      if (!aiRes.ok) {
+        const errText = await aiRes.text();
+        throw new Error(`Foundry ${aiRes.status}: ${errText.slice(0, 400)}`);
+      }
+      const aiJson = await aiRes.json();
+      const msg = aiJson.choices?.[0]?.message;
+      if (!msg) throw new Error("Empty AI response");
+
+      const toolCalls = msg.tool_calls || [];
+      if (toolCalls.length === 0) {
+        finalContent = msg.content || "";
+        messages.push({ role: "assistant", content: finalContent });
+        await db.insertChatMessage({
+          deviceId, userId, listType, role: "assistant", content: finalContent,
+        });
+        break;
+      }
+
+      const assistantMsg = { role: "assistant", content: msg.content || "", tool_calls: toolCalls };
+      messages.push(assistantMsg);
+      await db.insertChatMessage({
+        deviceId, userId, listType, role: "assistant",
+        content: msg.content || "",
+        toolCalls,
+      });
+
+      for (const call of toolCalls) {
+        let args = {};
+        try { args = JSON.parse(call.function?.arguments || "{}"); } catch {}
+        const name = call.function?.name;
+        const result = await chatTools.runTool(name, args, ctx);
+        const resultStr = JSON.stringify(result);
+        toolTrace.push({ name, args, resultPreview: resultStr.slice(0, 400) });
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          name,
+          content: resultStr,
+        });
+        await db.insertChatMessage({
+          deviceId, userId, listType, role: "tool",
+          content: resultStr,
+          toolName: name,
+          toolCallId: call.id,
+        });
+      }
+    }
+
+    if (finalContent == null) {
+      finalContent = "(Jeg nåede grænsen for værktøjskald uden at færdiggøre svaret. Prøv et mere fokuseret spørgsmål.)";
+      await db.insertChatMessage({
+        deviceId, userId, listType, role: "assistant", content: finalContent,
+      });
+    }
+
+    res.json({ content: finalContent, toolTrace });
+  } catch (err) {
+    console.error("AI chat error:", err.message);
+    res.status(500).json({ error: "Chat failed", detail: err.message });
+  }
+});
+
+app.get("/api/ai-chat/history", async (req, res) => {
+  if (!db.isEnabled()) return res.json({ messages: [] });
+  const deviceId = req.query.deviceId;
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  try {
+    const history = await db.getChatHistory(deviceId, CHAT_HISTORY_LIMIT);
+    res.json({ messages: history });
+  } catch (err) {
+    console.error("Chat history error:", err.message);
+    res.status(500).json({ error: "Failed to load chat history" });
+  }
+});
+
+app.delete("/api/ai-chat", async (req, res) => {
+  if (!db.isEnabled()) return res.json({ ok: true });
+  const deviceId = req.query.deviceId;
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  try {
+    await db.clearChatHistory(deviceId);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Chat clear error:", err.message);
+    res.status(500).json({ error: "Failed to clear chat" });
   }
 });
 
@@ -1192,23 +1152,19 @@ function matchAlerts(tickList, observations) {
   return alerts;
 }
 
-async function fetchTickListData(userId, listType) {
-  const cacheKey = `tick-${listType}-${userId}`;
-  const cached = getCached(cacheKey, TICK_CACHE_TTL);
-  if (cached) return cached;
-
+// Read-only by default: returns whatever's in the DB. The notification poller
+// passes { allowNetwork: true } so it can re-scrape netfugl when stale or
+// missing. No other caller is allowed to scrape.
+async function fetchTickListData(userId, listType, { allowNetwork = false } = {}) {
   if (db.isEnabled()) {
     try {
       const stored = await db.getTicklist(userId, listType);
-      if (stored && Date.now() - stored.fetchedAt < TICK_CACHE_TTL) {
-        const data = { birds: stored.birds };
-        setCache(cacheKey, data);
-        return data;
-      }
+      if (stored) return { birds: stored.birds };
     } catch (err) {
       console.error("DB ticklist read failed:", err.message);
     }
   }
+  if (!allowNetwork) return null;
 
   const url = `https://netfugl.dk/ranking/${listType}/${userId}`;
   const response = await fetch(url);
@@ -1235,30 +1191,18 @@ async function fetchTickListData(userId, listType) {
   });
   if (birds.length === 0) return null;
 
-  const data = { birds };
-  setCache(cacheKey, data);
-
   if (db.isEnabled()) {
     db.upsertTicklist(userId, listType, birds).catch((e) =>
       console.error("DB ticklist upsert failed:", e.message)
     );
   }
-  return data;
+  return { birds };
 }
 
+// Notification-only scraper for today's observations. Called from
+// checkAndNotify on its 5-minute interval — the one place we're allowed to
+// hit dofbasen for a non-seed read.
 async function fetchObsData() {
-  const cacheKey = "obs-push";
-  const cached = getCached(cacheKey, OBS_CACHE_TTL);
-  if (cached) return cached;
-
-  // Reuse the main observations cache if available
-  const mainCached = getCached("obs-all", OBS_CACHE_TTL);
-  if (mainCached) {
-    setCache(cacheKey, mainCached);
-    return mainCached;
-  }
-
-  // Fetch fresh
   try {
     const url = "https://dofbasen.dk/observationer/";
     const response = await fetch(url);
@@ -1322,9 +1266,7 @@ async function fetchObsData() {
       });
     }
 
-    const data = { observations };
-    setCache(cacheKey, data);
-    return data;
+    return { observations };
   } catch (err) {
     console.error("Push obs fetch error:", err.message);
     return null;
@@ -1341,7 +1283,7 @@ async function checkAndNotify() {
 
   for (const [subKey, sub] of subscribers.entries()) {
     try {
-      const tickList = await fetchTickListData(sub.userId, sub.listType);
+      const tickList = await fetchTickListData(sub.userId, sub.listType, { allowNetwork: true });
       if (!tickList) continue;
 
       const alerts = matchAlerts(tickList, obs);
@@ -1417,6 +1359,7 @@ const INDEX_HTML = fs.readFileSync(
   path.join(__dirname, "..", "public", "index.html")
 );
 app.get("*", (req, res) => {
+  res.set("Cache-Control", "no-cache");
   res.type("html").send(INDEX_HTML);
 });
 
@@ -1443,12 +1386,27 @@ async function bootstrap() {
 
   app.listen(PORT, () => {
     console.log(`🐦 Bird Ticker proxy running on http://localhost:${PORT}`);
-    fetchObservationsForDate(null)
+    refreshObservationsForDate(null)
       .then((d) => console.log(`🔥 Prewarmed observations: ${d.count} obs`))
       .catch((e) => console.error("Prewarm failed:", e.message));
     pushInterval = setInterval(checkAndNotify, PUSH_CHECK_INTERVAL);
     console.log(`📬 Push checker running every ${PUSH_CHECK_INTERVAL / 1000}s`);
+
+    if (db.isEnabled() && process.env.BACKFILL_DISABLED !== "true") {
+      setImmediate(() => {
+        backfill
+          .runBackfill({
+            years: parseInt(process.env.BACKFILL_YEARS || "3", 10),
+            fetchOne: (date) => refreshObservationsForDate(date),
+          })
+          .catch((e) => console.error("Backfill failed:", e.message));
+      });
+    }
   });
+
+  for (const sig of ["SIGTERM", "SIGINT"]) {
+    process.on(sig, () => backfill.abort());
+  }
 }
 
 bootstrap();

@@ -13,6 +13,8 @@
   <link rel="apple-touch-icon" href="/icons/icon.svg">
   <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 </head>
 <body>
   <!-- Header -->
@@ -79,17 +81,27 @@
         <div class="stat-value alert" id="stat-alerts">—</div>
         <div class="stat-label">Spottet!</div>
       </div>
+      <div class="stat">
+        <div class="stat-value" id="stat-observations" style="color: var(--accent);">—</div>
+        <div class="stat-label">Obs</div>
+      </div>
     </div>
 
     <!-- Tabs -->
     <div class="tabs">
-      <button class="tab active" data-view="alerts">🔔 Alarmer</button>
+      <button class="tab active" data-view="alerts">👁️ Observationer</button>
       <button class="tab" data-view="list">📋 Fugle</button>
-      <button class="tab" data-view="ai">🔮 AI</button>
+      <button class="tab" data-view="ai">💬 Chat</button>
       <button class="tab" data-view="calendar">📅 Kalender</button>
     </div>
 
-    <!-- Sort Bar (for alerts view) -->
+    <!-- Filter Bar (for observations view) -->
+    <div class="filter-bar" id="obs-filter-bar" style="display: flex;">
+      <button class="filter-btn active" data-obs-filter="missing">🎯 Kun manglende</button>
+      <button class="filter-btn" data-obs-filter="all">📋 Alle</button>
+    </div>
+
+    <!-- Sort Bar (for observations view) -->
     <div class="sort-bar" id="sort-bar">
       <span class="sort-label">Sortér:</span>
       <button class="sort-btn active" data-sort="distance">📍 Afstand</button>
@@ -116,6 +128,7 @@
         <div class="date-label" id="date-label">I dag</div>
         <button class="date-arrow" id="date-next" title="Næste dag">›</button>
       </div>
+      <div id="obs-map"></div>
       <div class="card-list" id="alerts-container">
         <div class="empty-state">
           <div class="emoji">🔭</div>
@@ -129,30 +142,39 @@
       <div id="list-container"></div>
     </div>
 
-    <!-- AI View -->
-    <div id="view-ai" style="display: none;">
-      <div class="ai-banner" id="ai-banner" style="display:none;">
-        <div class="ai-banner-header">
-          <span class="ai-banner-title">🔮 Forudsigelser</span>
-          <span class="ai-banner-meta" id="ai-banner-meta"></span>
-        </div>
-        <div class="ai-banner-body" id="ai-banner-body"></div>
+    <!-- AI Chat View -->
+    <div id="view-ai">
+      <div class="chat-header">
+        <div class="chat-meta">💬 Spørg ornitologen</div>
+        <button class="btn-link" id="btn-chat-clear" title="Ryd samtale">🗑️ Ryd</button>
       </div>
-      <div class="ai-empty-state" id="ai-empty-state" style="display:none;">
-        <div class="empty-state">
-          <div class="emoji">🔮</div>
-          <p>Henter forudsigelser...</p>
-        </div>
+      <div class="chat-messages" id="chat-messages"></div>
+      <div class="chat-suggestions" id="chat-suggestions">
+        <button class="chat-suggestion" data-prompt="Hvilke arter mangler jeg, og hvor er de mest sandsynlige at finde lige nu?">Hvor jagter jeg mine manglende arter?</button>
+        <button class="chat-suggestion" data-prompt="Hvilke 3 lokaliteter er mest oplagte for mig den næste uge?">Top 3 lokaliteter i den næste uge</button>
+        <button class="chat-suggestion" data-prompt="Hvad blev observeret i Danmark i går?">Gårsdagens observationer</button>
       </div>
+      <form class="chat-input-row" id="chat-form" autocomplete="off">
+        <textarea class="chat-input" id="chat-input" rows="1"
+                  placeholder="Spørg om manglende arter, lokaliteter, sæson..."></textarea>
+        <button type="submit" class="chat-send" id="chat-send" aria-label="Send">➤</button>
+      </form>
     </div>
 
     <!-- Calendar View -->
     <div id="view-calendar" style="display: none;">
-      <div class="calendar-header">
-        <div class="calendar-meta" id="calendar-meta"></div>
-        <button class="btn-link" id="btn-calendar-refresh" title="Generér på ny">🔄 Genberegn</button>
+      <div class="filter-bar" id="calendar-view-bar">
+        <button class="filter-btn active" data-calendar-view="ai">🔮 AI-tolket</button>
+        <button class="filter-btn" data-calendar-view="raw">📊 Rådata</button>
       </div>
-      <div id="calendar-body"></div>
+      <div id="calendar-ai-wrap">
+        <div class="calendar-header">
+          <div class="calendar-meta" id="calendar-meta"></div>
+          <button class="btn-link" id="btn-calendar-refresh" title="Generér på ny">🔄 Genberegn</button>
+        </div>
+        <div id="calendar-body"></div>
+      </div>
+      <div class="ai-raw" id="calendar-raw" style="display:none;"></div>
     </div>
 
     <!-- Footer -->

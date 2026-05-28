@@ -17,5 +17,9 @@
     "iconv-lite": "^0.6.3",
     "pg": "^8.21.0",
     "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.1.0",
+    "sharp": "^0.34.5"
   }
 }

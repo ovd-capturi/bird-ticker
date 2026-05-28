@@ -12,8 +12,44 @@ const Scraper = {
     return res.json();
    },
 
-  async fetchPredictions(userId, listType, lat, lng) {
-    const url = `${API_BASE}/api/ai-predictions?userId=${encodeURIComponent(userId)}&listType=${encodeURIComponent(listType)}&lat=${lat}&lng=${lng}`;
+  async sendChatMessage({ deviceId, userId, listType, lat, lng, message }) {
+    const res = await fetch(`${API_BASE}/api/ai-chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId, userId, listType, lat, lng, message }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    return res.json();
+   },
+
+  async fetchChatHistory(deviceId) {
+    const res = await fetch(
+      `${API_BASE}/api/ai-chat/history?deviceId=${encodeURIComponent(deviceId)}`
+    );
+    if (!res.ok) return { messages: [] };
+    return res.json();
+   },
+
+  async clearChatHistory(deviceId) {
+    const res = await fetch(
+      `${API_BASE}/api/ai-chat?deviceId=${encodeURIComponent(deviceId)}`,
+      { method: "DELETE" }
+    );
+    return res.ok;
+   },
+
+  async fetchPredictorDataset({ userId, listType, lat, lng, mode = "day", month }) {
+    const params = new URLSearchParams({ userId, listType, mode });
+    if (mode === "day") {
+      params.set("lat", lat);
+      params.set("lng", lng);
+    } else if (mode === "calendar") {
+      params.set("month", month);
+    }
+    const url = `${API_BASE}/api/predictor-dataset?${params.toString()}`;
     const res = await fetch(url);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -22,8 +58,8 @@ const Scraper = {
     return res.json();
    },
 
-  async fetchCalendarMonth(userId, listType, lat, lng, month) {
-    const url = `${API_BASE}/api/ai-calendar?userId=${encodeURIComponent(userId)}&listType=${encodeURIComponent(listType)}&lat=${lat}&lng=${lng}&month=${encodeURIComponent(month)}`;
+  async fetchCalendarMonth(userId, listType, month) {
+    const url = `${API_BASE}/api/ai-calendar?userId=${encodeURIComponent(userId)}&listType=${encodeURIComponent(listType)}&month=${encodeURIComponent(month)}`;
     const res = await fetch(url);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
