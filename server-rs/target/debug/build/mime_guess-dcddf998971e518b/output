@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/Users/ole/private/bird-app/server-rs/target/debug/build/mime_guess-dcddf998971e518b/out/mime_types_generated.rs

@@ -1,0 +1,11 @@
+/Users/ole/private/bird-app/server-rs/target/release/deps/either-d4d2ec7c862a242d.d: /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/lib.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/serde_untagged.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/serde_untagged_optional.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/iterator.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/into_either.rs
+
+/Users/ole/private/bird-app/server-rs/target/release/deps/libeither-d4d2ec7c862a242d.rlib: /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/lib.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/serde_untagged.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/serde_untagged_optional.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/iterator.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/into_either.rs
+
+/Users/ole/private/bird-app/server-rs/target/release/deps/libeither-d4d2ec7c862a242d.rmeta: /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/lib.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/serde_untagged.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/serde_untagged_optional.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/iterator.rs /Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/into_either.rs
+
+/Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/lib.rs:
+/Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/serde_untagged.rs:
+/Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/serde_untagged_optional.rs:
+/Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/iterator.rs:
+/Users/ole/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/either-1.16.0/src/into_either.rs:
