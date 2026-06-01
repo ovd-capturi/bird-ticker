@@ -160,10 +160,22 @@ async fn localities(State(st): State<AppState>, Query(q): Query<HashMap<String, 
 }
 
 // ── GET /api/species-map ───────────────────────────────────────────────
+// Always served from the in-memory cache refreshed by the background task in
+// `main` (the underlying query is a slow full-table scan over `observations`).
+// Only computes inline if the cache is still empty (boot prewarm not done).
 async fn species_map(State(st): State<AppState>) -> impl IntoResponse {
-    let Some(db) = &st.db else { return Json(json!({ "count": 0, "byName": {} })); };
+    {
+        let guard = st.species_map.read().await;
+        if let Some((_, m)) = guard.as_ref() {
+            return Json(json!({ "count": m.len(), "byName": m }));
+        }
+    }
+    let Some(db) = st.db.clone() else { return Json(json!({ "count": 0, "byName": {} })); };
     match db.get_species_map().await {
-        Ok(by_name) => Json(json!({ "count": by_name.len(), "byName": by_name })),
+        Ok(m) => {
+            *st.species_map.write().await = Some((std::time::Instant::now(), m.clone()));
+            Json(json!({ "count": m.len(), "byName": m }))
+        }
         Err(e) => {
             tracing::error!("Species map error: {e}");
             Json(json!({ "count": 0, "byName": {} }))

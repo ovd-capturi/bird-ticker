@@ -49,6 +49,9 @@ pub struct AppState {
     pub refresh_flight: Arc<SingleFlight<Result<u64, String>>>,
     /// Cached `index.html` for the SPA fallback.
     pub index_html: Arc<String>,
+    /// Cached species→artId map (the source query is a full-table scan that is
+    /// slow on the production-sized `observations` table; refreshed lazily).
+    pub species_map: Arc<tokio::sync::RwLock<Option<(std::time::Instant, std::collections::HashMap<String, String>)>>>,
 }
 
 #[tokio::main]
@@ -94,6 +97,7 @@ async fn main() {
         subscribers: Arc::new(DashMap::new()),
         refresh_flight: Arc::new(SingleFlight::new()),
         index_html: Arc::new(index_html),
+        species_map: Arc::new(tokio::sync::RwLock::new(None)),
     };
 
     // Restore persisted push subscriptions into the in-memory map.
@@ -147,6 +151,26 @@ fn spawn_background_tasks(state: &AppState) {
         match push::refresh_observations_for_date(&st, None).await {
             Ok(n) => tracing::info!("🔥 Prewarmed observations: {n} obs"),
             Err(e) => tracing::error!("Prewarm failed: {e}"),
+        }
+    });
+
+    // Refresh the species-map cache at boot then every 30 min, in the
+    // background, so no request ever pays for the slow full-table query.
+    let st = state.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_secs(1800));
+        loop {
+            iv.tick().await; // first tick is immediate → prewarm at boot
+            if let Some(db) = &st.db {
+                match db.get_species_map().await {
+                    Ok(m) => {
+                        let n = m.len();
+                        *st.species_map.write().await = Some((std::time::Instant::now(), m));
+                        tracing::info!("🗺️  Species map cached: {n} species");
+                    }
+                    Err(e) => tracing::error!("species-map refresh failed: {e}"),
+                }
+            }
         }
     });
 
