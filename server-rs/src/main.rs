@@ -143,16 +143,27 @@ async fn main() {
     axum::serve(listener, app).await.expect("server error");
 }
 
-/// Prewarm, the 5-minute push poller, and (optionally) the backfill seeder.
+/// The 5-minute refresh-then-notify loop, the species-map cache, and
+/// (optionally) the backfill seeder.
 fn spawn_background_tasks(state: &AppState) {
-    // Prewarm today's observations (network).
+    // Refresh today's observations into the DB, then run the push checker
+    // against that freshly-stored data. The DB is the single source of truth:
+    // notifications match exactly what the app shows, so a bird can never be
+    // notified without also appearing in `/api/observations`. The first tick is
+    // immediate, so this doubles as the boot prewarm.
     let st = state.clone();
     tokio::spawn(async move {
-        match push::refresh_observations_for_date(&st, None).await {
-            Ok(n) => tracing::info!("🔥 Prewarmed observations: {n} obs"),
-            Err(e) => tracing::error!("Prewarm failed: {e}"),
+        let mut iv = tokio::time::interval(Duration::from_secs(5 * 60));
+        loop {
+            iv.tick().await;
+            match push::refresh_observations_for_date(&st, None).await {
+                Ok(n) => tracing::info!("🔥 Refreshed today's observations: {n} obs"),
+                Err(e) => tracing::error!("Observation refresh failed: {e}"),
+            }
+            push::check_and_notify(&st).await;
         }
     });
+    tracing::info!("📬 Observation refresh + push checker running every 300s");
 
     // Refresh the species-map cache at boot then every 30 min, in the
     // background, so no request ever pays for the slow full-table query.
@@ -173,18 +184,6 @@ fn spawn_background_tasks(state: &AppState) {
             }
         }
     });
-
-    // Push checker every 5 minutes.
-    let st = state.clone();
-    tokio::spawn(async move {
-        let mut iv = tokio::time::interval(Duration::from_secs(5 * 60));
-        iv.tick().await; // consume the immediate first tick (setInterval semantics)
-        loop {
-            iv.tick().await;
-            push::check_and_notify(&st).await;
-        }
-    });
-    tracing::info!("📬 Push checker running every 300s");
 
     // Backfill, unless disabled.
     let abort = Arc::new(AtomicBool::new(false));

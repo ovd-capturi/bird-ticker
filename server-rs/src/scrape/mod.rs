@@ -29,18 +29,6 @@ pub struct Observation {
     pub seasonal: bool,
 }
 
-/// Lighter shape from the notification-only `fetchObsData` scraper.
-#[derive(serde::Serialize, Clone, Debug, PartialEq)]
-pub struct LightObs {
-    pub species: String,
-    pub latin: String,
-    pub location: String,
-    pub count: i32,
-    pub time: String,
-    pub rare: bool,
-    pub scarce: bool,
-}
-
 /// A Netfugl ticklist entry. JSON keys match the array stored in `ticklists`.
 #[derive(serde::Serialize, Clone, Debug, PartialEq)]
 pub struct Bird {

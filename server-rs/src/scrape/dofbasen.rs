@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
-use super::{LightObs, Observation};
+use super::Observation;
 
 /// Species-block delimiter. Groups: 1=artId, 2=fullTitle, 3=cssClass,
 /// 4=danishName, 5=latinName. Identical to the JS regex.
@@ -199,78 +199,6 @@ pub fn parse_observations(html: &str, _date_label: &str) -> Vec<Observation> {
     observations
 }
 
-/// Lighter parser used by the notification poller (`fetchObsData`): today only,
-/// species + location + count + time, deduped per species+location.
-pub fn parse_observations_light(html: &str) -> Vec<LightObs> {
-    let tr_sel = Selector::parse("table tr").unwrap();
-    let td_sel = Selector::parse("td").unwrap();
-    let lok_sel = Selector::parse("a.lokalitet").unwrap();
-    let count_sel = Selector::parse(r#"td[align="right"] a.arter"#).unwrap();
-    let clock_sel = Selector::parse("i.fa-clock-o[title]").unwrap();
-    static OPHOLD_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"Ophold p.{1,2} lokaliteten: ").unwrap());
-
-    let blocks: Vec<Block> = SPECIES_RE
-        .captures_iter(html)
-        .map(|c| Block {
-            index: c.get(0).unwrap().start(),
-            art_id: c[1].to_string(),
-            css_class: c[3].to_string(),
-            danish: c[4].trim().to_string(),
-            latin: c[5].trim().to_string(),
-        })
-        .collect();
-
-    let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    for i in 0..blocks.len() {
-        let sp = &blocks[i];
-        let start = sp.index;
-        let end = if i + 1 < blocks.len() { blocks[i + 1].index } else { html.len() };
-        let frag = Html::parse_fragment(&html[start..end]);
-
-        for row in frag.select(&tr_sel) {
-            if row.select(&td_sel).count() < 10 {
-                continue;
-            }
-            let location = match row.select(&lok_sel).next() {
-                Some(l) => text_of(l),
-                None => String::new(),
-            };
-            if location.is_empty() {
-                continue;
-            }
-            let key = format!("{}-{}", sp.danish, location);
-            if !seen.insert(key) {
-                continue;
-            }
-            let count = row
-                .select(&count_sel)
-                .next()
-                .map(|e| parse_int_prefix(&text_of(e)))
-                .unwrap_or(0);
-            let time = row
-                .select(&clock_sel)
-                .next()
-                .and_then(|c| c.value().attr("title"))
-                .map(|t| OPHOLD_RE.replace(t, "").to_string())
-                .unwrap_or_default();
-
-            out.push(LightObs {
-                species: sp.danish.clone(),
-                latin: sp.latin.clone(),
-                location,
-                count,
-                time,
-                rare: sp.css_class == "su",
-                scarce: sp.css_class == "subart",
-            });
-        }
-    }
-    out
-}
-
 /// Fetch today's (GET) or a past date's (POST) observations page and parse it.
 pub async fn fetch_observations(client: &reqwest::Client, date: Option<&str>) -> anyhow::Result<Vec<Observation>> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -292,16 +220,6 @@ pub async fn fetch_observations(client: &reqwest::Client, date: Option<&str>) ->
     }
     let bytes = resp.bytes().await?;
     Ok(parse_observations(&decode_latin1(&bytes), effective))
-}
-
-/// Fetch today's observations with the lighter parser (notification poller).
-pub async fn fetch_observations_light(client: &reqwest::Client) -> anyhow::Result<Vec<LightObs>> {
-    let resp = client.get("https://dofbasen.dk/observationer/").send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("DOFbasen returned {}", resp.status().as_u16());
-    }
-    let bytes = resp.bytes().await?;
-    Ok(parse_observations_light(&decode_latin1(&bytes)))
 }
 
 /// Resolve a locality's centre coords from DOFbasen's `poplok.php`. Mirrors the

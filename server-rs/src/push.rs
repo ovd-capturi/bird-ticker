@@ -146,22 +146,25 @@ async fn resolve_coords(db: &crate::db::Db, http: &reqwest::Client, obs: &mut [O
     }
 }
 
-/// 5-minute poller: scrape today, send each subscriber any newly-matching
-/// missing species, prune expired subscriptions.
+/// Poller: match each subscriber's missing species against today's stored
+/// observations, send newly-matching ones, prune expired subscriptions. Runs
+/// *after* `refresh_observations_for_date` has upserted today, so it matches
+/// against exactly the data the app reads from `/api/observations` — a bird can
+/// never be notified without also appearing in the app.
 pub async fn check_and_notify(st: &AppState) {
     if st.subscribers.is_empty() {
         return;
     }
     let Some(db) = st.db.clone() else { return };
 
-    let obs_light = match dofbasen::fetch_observations_light(&st.http).await {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let observations = match db.get_observations_by_date(&today).await {
         Ok(o) => o,
         Err(e) => {
-            tracing::error!("Push obs fetch error: {e}");
+            tracing::error!("Push obs DB read error: {e}");
             return;
         }
     };
-    let observations: Vec<Value> = obs_light.iter().map(|o| serde_json::to_value(o).unwrap()).collect();
 
     let endpoints: Vec<String> = st.subscribers.iter().map(|e| e.key().clone()).collect();
     for sub_key in endpoints {
