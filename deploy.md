@@ -1,241 +1,104 @@
 # Bird Ticker Deployment Guide
 
 ## Overview
-Bird Ticker is a web application that fetches bird observation data from Netfugl and DOFbasen APIs, displaying alerts when missing species are spotted.
+Bird Ticker is a PWA that scrapes bird observations from Netfugl and DOFbasen
+and pushes alerts when missing species are spotted. The backend is the Rust
+service in `server-rs/` (the former Node `proxy/` app has been retired).
 
 ## Deployment Target
-- **Platform**: Azure App Service (Linux, Node.js)
-- **App Name**: bird-ticker-dk
-- **Resource Group**: bird-ticker-rg
-- **App Service Plan**: ole_asp_7568
-- **Domain**: https://bird-ticker-dk.azurewebsites.net
-- **Node Version**: 20.20.0 (configurable)
+- **Platform**: Azure App Service (Linux **custom container**)
+- **App Name**: `bird-ticker-dk`
+- **URL**: https://bird-ticker-dk.azurewebsites.net
+- **Resource Group**: `bird-ticker-rg`
+- **App Service Plan**: `ole_asp_7568`
+- **Container Registry**: `birdtickeracr.azurecr.io`
+- **Image**: `birdtickeracr.azurecr.io/bird-ticker-rs:<tag>`
 
 ## Prerequisites
-- Node.js >= v20
-- Azure CLI installed
-- Azure subscription with access to resource group `bird-ticker-rg`
+- Azure CLI, authenticated (`az account show`)
+- Access to resource group `bird-ticker-rg` and registry `birdtickeracr`
+- For local builds: Rust toolchain, or Podman
 
-## Deployment Steps
+## Build the image
 
-### 1. Local Testing
-```bash
-# Start local server
-PORT=3000 node proxy/server.js
-
-# Test endpoints
-curl http://localhost:3000/api/ticklist?userId=5653&listType=1
-curl http://localhost:3000/api/observations
-curl http://localhost:3000/api/push/vapid-key
-```
-
-For a local Postgres, use the bundled `docker-compose.yml`:
-```bash
-podman compose up -d
-```
-
-### 2. Build Deployment Package
-```bash
-cd /Users/ole/private/bird-app
-
-# Create zip with app files and dependencies
-zip -r bird-ticker-deploy.zip \
-  proxy/ \
-  public/ \
-  package.json \
-  .azure/config \
-  node_modules/ \
-  --exclude="node_modules/.cache/*" \
-  --exclude="**/README*"
-```
-
-### 3. Deploy to Azure
-```bash
-# Method 1: Zip deploy
-az webapp deployment source config-zip \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk \
-  --src bird-ticker-deploy.zip
-
-# Method 2: Direct deploy (recommended)
-az webapp deploy \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk \
-  --src-path bird-ticker-deploy.zip \
-  --type zip
-```
-
-### 4. Verify Deployment
-```bash
-# Check app status
-az webapp show \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk
-
-# Check logs
-az webapp log tail \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk
-
-# Test deployment
-curl -I https://bird-ticker-dk.azurewebsites.net/
-curl https://bird-ticker-dk.azurewebsites.net/api/ticklist?userId=5653&listType=1
-```
-
-## Database (Postgres)
-
-Azure Database for PostgreSQL Flexible Server hosts the app's relational data. The server lives in the same region as the App Service to keep latency low and egress free.
-
-### 1. Provision the Server
-Generate a strong admin password first and store it in Azure Key Vault or as an App Service setting; do not commit it. Then:
+Builds run server-side on ACR (its agents are x86_64; cross-building amd64
+locally on Apple Silicon segfaults `rustc` under QEMU). Build context is the
+repo root; `.dockerignore` keeps `node_modules`, `server-rs/target`, and `.git`
+out of the upload.
 
 ```bash
-az postgres flexible-server create \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-pg \
-  --location westeurope \
-  --tier Burstable \
-  --sku-name Standard_B1ms \
-  --storage-size 32 \
-  --version 16 \
-  --admin-user birdapp \
-  --admin-password "<generate>" \
-  --public-access 0.0.0.0 \
-  --database-name birdapp
+az acr build \
+  --registry birdtickeracr \
+  --image bird-ticker-rs:v3 \
+  --file server-rs/Dockerfile .
 ```
 
-Notes:
-- `--public-access 0.0.0.0` enables the "Allow Azure services" firewall entry; explicit client IPs are added as separate rules below.
-- Keep the generated password in Key Vault or in `az webapp config appsettings` (see step 5). Avoid plain-text storage.
-
-### 2. Firewall Rules
-Allow Azure-hosted services (covers the App Service outbound IPs). Add additional rules for any developer IPs that need direct access:
+### Docker Hub rate limits
+ACR's build agents pull the base images (`rust`, `debian`) from Docker Hub
+anonymously and can hit the `TOOMANYREQUESTS` pull limit. The Dockerfile's base
+images are parameterised (`RUST_IMAGE`, `RUNTIME_IMAGE`) so you can host copies
+in ACR and build without touching Docker Hub:
 
 ```bash
-az postgres flexible-server firewall-rule create \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-pg \
-  --rule-name allow-azure --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0
+# One-time: seed the bases into ACR. `az acr import` shares the same throttled
+# egress, so if it returns 429, push from a local machine instead:
+for img in rust:1-slim-bookworm debian:bookworm-slim; do
+  podman pull --platform linux/amd64 docker.io/library/$img
+  podman tag docker.io/library/$img birdtickeracr.azurecr.io/$img
+  podman push birdtickeracr.azurecr.io/$img
+done
+
+az acr build --registry birdtickeracr --image bird-ticker-rs:v3 \
+  --file server-rs/Dockerfile \
+  --build-arg RUST_IMAGE=birdtickeracr.azurecr.io/rust:1-slim-bookworm \
+  --build-arg RUNTIME_IMAGE=birdtickeracr.azurecr.io/debian:bookworm-slim .
 ```
 
-### 3. Wire the Connection String into App Service
+## Deploy a new image
+Point the app at the new tag and restart:
+
 ```bash
-az webapp config appsettings set \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk \
-  --settings DATABASE_URL="postgresql://birdapp:<password>@bird-ticker-pg.postgres.database.azure.com:5432/birdapp?sslmode=require"
-```
-
-### 4. Migrations
-The app applies migrations on boot from `proxy/db/migrations/*.sql` in lexical order.
-
-## Configuration
-
-### App Settings (Azure Portal)
-- **NODE_VERSION**: Set to `24-lts` or `24.x`
-- **WEBSITE_HTTP_LOGGING_DISABLED**: `false`
-- **Always On**: `true`
-
-### Environment Variables
-```
-VAPID_PUBLIC=your_public_key
-VAPID_PRIVATE=your_private_key
-PORT=3000
-DATABASE_URL=postgresql://birdapp:...@bird-ticker-pg.postgres.database.azure.com:5432/birdapp?sslmode=require
-AZURE_OPENAI_ENDPOINT=...
-AZURE_OPENAI_KEY=...
-```
-
-### Startup Command
-```bash
-npm start
-```
-
-## Updating the App
-
-### Quick Update
-```bash
-# 1. Make code changes locally
-# 2. Rebuild deployment package
-cd /Users/ole/private/bird-app
-rm -f bird-ticker-deploy.zip
-zip -r bird-ticker-deploy.zip proxy/ public/ package.json .azure/config node_modules/
-
-# 3. Redeploy
-az webapp deploy \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk \
-  --src-path bird-ticker-deploy.zip \
-  --type zip
-```
-
-## Troubleshooting
-
-### App Not Starting
-```bash
-# Check deployment logs
-az webapp log tail --resource-group bird-ticker-rg --name bird-ticker-dk
-
-# Check app settings
-az webapp config show --resource-group bird-ticker-rg --name bird-ticker-dk
-
-# Restart app
+az webapp config container set \
+  --resource-group bird-ticker-rg --name bird-ticker-dk \
+  --container-image-name birdtickeracr.azurecr.io/bird-ticker-rs:v3 \
+  --container-registry-url https://birdtickeracr.azurecr.io
 az webapp restart --resource-group bird-ticker-rg --name bird-ticker-dk
 ```
 
-### Deployment Failed
-```bash
-# Check deployment history
-az webapp deployment list-deployments \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk
+## App settings
+Required environment variables (set via `az webapp config appsettings set`):
 
-# View deployment log
-az resource show \
-  --resource-type Microsoft.Web/deployments \
-  --resource-group bird-ticker-rg \
-  --parent "sites/bird-ticker-dk/default" \
-  --name <deployment-name> \
-  --query properties.logs
+```
+WEBSITES_PORT=3000                 # container listens on 3000
+DATABASE_URL=postgresql://birdapp:<pw>@bird-ticker-pg.postgres.database.azure.com:5432/birdapp?sslmode=require
+DOCKER_REGISTRY_SERVER_URL=https://birdtickeracr.azurecr.io
+DOCKER_REGISTRY_SERVER_USERNAME=<acr-user>
+DOCKER_REGISTRY_SERVER_PASSWORD=<acr-pass>
+AZURE_FOUNDRY_ENDPOINT=...
+AZURE_FOUNDRY_KEY=...
+AZURE_FOUNDRY_DEPLOYMENT=...
+BACKFILL_DISABLED=true             # optional; skip the historical seeder
+# VAPID_PUBLIC / VAPID_PRIVATE are optional — the binary ships dev defaults.
 ```
 
-### Code Changes Not Applied
-```bash
-# Force deployment
-az webapp deployment source config-zip \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk \
-  --src bird-ticker-deploy.zip \
-  --force
+Keep secrets in Key Vault or app settings; never commit them.
 
-# Or use container log
-az webapp log show --resource-group bird-ticker-rg --name bird-ticker-dk
+## Database (Postgres)
+Azure Database for PostgreSQL Flexible Server `bird-ticker-pg` (westeurope,
+same region as the App Service). The Rust app applies migrations from the
+binary-embedded `server-rs/migrations/*.sql` on boot. See git history for the
+original provisioning commands.
+
+## Verify
+```bash
+curl -I https://bird-ticker-dk.azurewebsites.net/healthz
+curl "https://bird-ticker-dk.azurewebsites.net/api/observations"
+az webapp log tail --resource-group bird-ticker-rg --name bird-ticker-dk
 ```
 
-## Monitoring
-
-### Check App Health
+## Local development
 ```bash
-# HTTP response
-curl -I https://bird-ticker-dk.azurewebsites.net/
-curl https://bird-ticker-dk.azurewebsites.net/api/ticklist?userId=5653&listType=1
-
-# Application logs
-az webapp log tail \
-  --resource-group bird-ticker-rg \
-  --name bird-ticker-dk
+podman compose up -d                       # Postgres + pgvector on :5432
+cd server-rs
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/birdapp cargo run
 ```
-
-### Monitoring Setup (Optional)
-Configure Azure Monitor alerts for:
-- HTTP Failures
-- CPU Usage
-- Memory Utilization
-
-## URLs
-- Main App: https://bird-ticker-dk.azurewebsites.net
-- Admin/Logs: https://bird-ticker-dk.scm.azurewebsites.net
-- Health Check: https://bird-ticker-dk.azurewebsites.net/api/ticklist?userId=5653&listType=1
-
-## Contact
-For issues: Check Azure logs first, then review browser console for client-side errors.

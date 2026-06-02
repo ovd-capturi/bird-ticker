@@ -4,9 +4,15 @@
 # No DB needed at build time (queries are runtime-checked; migrations + species
 # facts are embedded into the binary).
 
+# Base images are parameterised so CI can point them at registry-hosted copies
+# (e.g. ACR) when Docker Hub anonymous pull limits block the build agent. The
+# defaults keep local `podman build` unchanged.
+ARG RUST_IMAGE=rust:1-slim-bookworm
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+
 # Pin to bookworm so the build-time OpenSSL/libcurl matches the bookworm-slim
 # runtime (a trixie build links OPENSSL_3.2.0+ which bookworm lacks).
-FROM rust:1-slim-bookworm AS build
+FROM ${RUST_IMAGE} AS build
 WORKDIR /build
 # Build deps: openssl + libcurl for the web-push (isahc) client.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,7 +24,7 @@ COPY server-rs/migrations ./migrations
 COPY server-rs/data ./data
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM ${RUNTIME_IMAGE}
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 libcurl4 \
