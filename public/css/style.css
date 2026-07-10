@@ -33,7 +33,6 @@ html, body {
 }
 
 body {
-  padding-top: var(--safe-top);
   padding-bottom: var(--safe-bottom);
 }
 
@@ -42,7 +41,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px 12px;
+  padding: calc(16px + var(--safe-top)) 20px 12px;
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;

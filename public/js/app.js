@@ -158,9 +158,12 @@ const App = {
     });
 
     document.querySelectorAll(".sort-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", async () => {
         this.sortMode = btn.dataset.sort;
         document.querySelectorAll(".sort-btn").forEach((b) => b.classList.toggle("active", b === btn));
+        if (this.sortMode === "distance") {
+          await this.getUserLocation();
+        }
         this.renderAlerts();
       });
     });
@@ -947,7 +950,15 @@ const App = {
         };
       });
     }
-    return Storage.getAlerts() || [];
+    // Recompute distance from the current user location so a freshly fetched
+    // location (e.g. when switching to distance sort) is reflected.
+    return (Storage.getAlerts() || []).map((alert) => {
+      const dist = Scraper.distanceKm(this.userLat, this.userLng, alert.lat, alert.lng);
+      return {
+        ...alert,
+        distance: dist != null ? Math.round(dist * 10) / 10 : null,
+      };
+    });
   },
 
   renderAlerts() {
@@ -982,22 +993,26 @@ const App = {
 
     const tree = [];
     for (const [key, obsArray] of speciesGroups) {
-      obsArray.sort((a, b) => {
-        const ta = Scraper.parseTimeMinutes(a.time);
-        const tb = Scraper.parseTimeMinutes(b.time);
-        if (ta == null && tb == null) return 0;
-        if (ta == null) return 1;
-        if (tb == null) return -1;
-        return tb - ta;
-      });
-
       const locations = [...new Set(obsArray.map(o => o.location))];
       const times = obsArray.map(o => o.time).filter(Boolean);
       const total = obsArray.reduce((sum, o) => sum + (o.count || 0), 0);
 
       const distances = obsArray.map(o => o.distance).filter(d => d != null);
       const minDistance = distances.length ? Math.min(...distances) : null;
-      const latestTime = obsArray[0].time;
+
+      // Group's representative time = latest observation, independent of how
+      // the observations end up sorted below.
+      const obsMinutes = obsArray
+        .map(o => Scraper.parseTimeMinutes(o.time))
+        .filter(t => t != null);
+      const latestMinutes = obsMinutes.length ? Math.max(...obsMinutes) : null;
+      const latestTime = latestMinutes != null
+        ? obsArray.find(o => Scraper.parseTimeMinutes(o.time) === latestMinutes).time
+        : null;
+
+      // Sort the group's observations to match the active sort mode, so opening
+      // a bird shows its observations in the same order as the group list.
+      const sortedObs = Scraper.sortAlerts(obsArray, this.sortMode);
 
       tree.push({
         type: "group",
@@ -1015,11 +1030,11 @@ const App = {
         time: latestTime
       });
 
-      for (const obs of obsArray) {
+      for (const obs of sortedObs) {
         tree.push({
           ...obs,
           type: "observation",
-          isLast: obs === obsArray[obsArray.length - 1]
+          isLast: obs === sortedObs[sortedObs.length - 1]
         });
       }
     }
