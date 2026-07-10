@@ -92,6 +92,7 @@ pub async fn run_tool(st: &AppState, ctx: &ChatCtx, name: &str, args: &Value) ->
         "lookup_species" => tool_lookup_species(st, args).await,
         "lookup_locality" => tool_lookup_locality(st, args).await,
         "get_ticklist_summary" => Ok(tool_ticklist_summary(ctx)),
+        "list_ticked_species" => Ok(tool_ticked_species(ctx, args)),
         "get_recent_observations" => tool_recent_observations(st, args).await,
         "lookup_species_facts" => Ok(tool_species_facts(args)),
         _ => return json!({ "error": format!("Unknown tool {name}") }),
@@ -208,6 +209,48 @@ fn tool_ticklist_summary(ctx: &ChatCtx) -> Value {
     })
 }
 
+fn tool_ticked_species(ctx: &ChatCtx, args: &Value) -> Value {
+    let query = args.get("query").and_then(|v| v.as_str()).map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let only_su = args.get("onlySU").and_then(|v| v.as_bool()) == Some(true);
+    let limit = clamp_limit(args, 50) as usize;
+
+    let ticked: Vec<&Value> = ctx
+        .birds
+        .iter()
+        .filter(|b| b.get("ticked").and_then(|v| v.as_bool()) == Some(true))
+        .collect();
+
+    let matched: Vec<&Value> = ticked
+        .iter()
+        .copied()
+        .filter(|b| {
+            if only_su && b.get("isSU").and_then(|v| v.as_bool()) != Some(true) {
+                return false;
+            }
+            match &query {
+                None => true,
+                Some(q) => {
+                    let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    let latin = b.get("latin").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    name.contains(q.as_str()) || latin.contains(q.as_str())
+                }
+            }
+        })
+        .collect();
+
+    let species: Vec<Value> = matched.iter().take(limit).map(|b| json!({
+        "name": b.get("name"), "latin": b.get("latin"), "isSU": b.get("isSU"),
+    })).collect();
+
+    json!({
+        "totalTicked": ticked.len(),
+        "matched": matched.len(),
+        "returned": species.len(),
+        "truncated": matched.len() > species.len(),
+        "species": species,
+    })
+}
+
 async fn tool_recent_observations(st: &AppState, args: &Value) -> anyhow::Result<Value> {
     let db = st.db.as_ref().ok_or_else(|| anyhow::anyhow!("DB not configured"))?;
     let date = args.get("date").and_then(|v| v.as_str()).filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-');
@@ -311,6 +354,15 @@ pub fn tool_schemas() -> Value {
                 "latin": { "type": "string", "description": "Latin name (preferred)." },
                 "name": { "type": "string", "description": "Danish common name." },
                 "artId": { "type": "string", "description": "5-digit DOFbasen art id." }
+            } }
+        }},
+        { "type": "function", "function": {
+            "name": "list_ticked_species",
+            "description": "Returns the species the user has ALREADY ticked (krydset) on their Netfugl list. Use this when the user asks what they have seen/ticked, whether a specific species is ticked, or for their ticked SU species. Optionally filter by a name/latin fragment or restrict to SU species.",
+            "parameters": { "type": "object", "properties": {
+                "query": { "type": "string", "description": "Case-insensitive fragment matched against Danish name or latin name (optional)." },
+                "onlySU": { "type": "boolean", "description": "If true, only return ticked SU species (optional)." },
+                "limit": { "type": "integer", "description": "Max species returned (1-100, default 50)." }
             } }
         }},
         { "type": "function", "function": {
