@@ -10,10 +10,14 @@ use scraper::{ElementRef, Html, Selector};
 use super::Observation;
 
 /// Species-block delimiter. Groups: 1=artId, 2=fullTitle, 3=cssClass,
-/// 4=danishName, 5=latinName. Identical to the JS regex.
+/// 4=danishName, 5=latinName. SU (rarity) species are wrapped in square
+/// brackets and carry a parenthesised `(SU)` marker between the name link and
+/// the latin name — e.g. `[<span class="su">Munkegrib</span></a>] (SU)
+/// (<i>Aegypius monachus</i>):` — so the closing `]` and marker are tolerated
+/// here. Ordinary species have neither and match the same pattern.
 static SPECIES_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"<a[^>]*class="arter"[^>]*href="[^"]*art=(\d+)[^"]*"[^>]*title="Alle observationer af ([^"]+)"[^>]*><span class="(defaultart|subart|su|seasonart)">([^<]+)</span></a>\s*\(<i>([^<]+)</i>\):"#,
+        r#"<a[^>]*class="arter"[^>]*href="[^"]*art=(\d+)[^"]*"[^>]*title="Alle observationer af ([^"]+)"[^>]*><span class="(defaultart|subart|su|seasonart)">([^<]+)</span></a>\]?\s*(?:\([^)]*\)\s*)?\(<i>([^<]+)</i>\):"#,
     )
     .unwrap()
 });
@@ -241,6 +245,26 @@ pub async fn fetch_locality_coords(client: &reqwest::Client, loknr: &str) -> (Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SU (rarity) species are bracketed and carry a `(SU)` marker between the
+    /// name link and the latin name; the delimiter regex must still capture
+    /// them, else they never enter the DB or the "missing ticks" list.
+    #[test]
+    fn species_re_matches_su_species() {
+        let su = r#"[<a class="arter" href="/search/search1.php?soeg=soeg&art=02550&visning=allfugle" title="Alle observationer af Munkegrib i 2026"><span class="su">Munkegrib</span></a>] (SU) (<i>Aegypius monachus</i>):"#;
+        let c = SPECIES_RE.captures(su).expect("SU species block should match");
+        assert_eq!(&c[1], "02550");
+        assert_eq!(&c[3], "su");
+        assert_eq!(&c[4], "Munkegrib");
+        assert_eq!(&c[5], "Aegypius monachus");
+
+        // Ordinary species (no bracket, no marker) must still match.
+        let normal = r#"<a class="arter" href="/search/search1.php?art=02130" title="Alle observationer af Sortand i 2026"><span class="defaultart">Sortand</span></a> (<i>Melanitta nigra</i>):"#;
+        let c = SPECIES_RE.captures(normal).expect("ordinary species block should match");
+        assert_eq!(&c[3], "defaultart");
+        assert_eq!(&c[4], "Sortand");
+        assert_eq!(&c[5], "Melanitta nigra");
+    }
 
     /// Fixture-driven parity dump: set BIRD_OBS_FIXTURE (raw ISO-8859-1 bytes)
     /// and BIRD_OBS_OUT to write parsed observations as JSON for comparison
