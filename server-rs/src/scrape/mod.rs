@@ -24,6 +24,15 @@ pub struct Observation {
     pub observer: String,
     pub behavior: String,
     pub time: String,
+    /// Observer's free-text remark (`bemærkning`). Empty when absent.
+    #[serde(default)]
+    pub note: String,
+    /// Finer free-text place detail beyond the coarse `location` locality.
+    #[serde(default)]
+    pub place: Option<String>,
+    /// Absolute URLs of any photos attached to the observation.
+    #[serde(default)]
+    pub pictures: Vec<String>,
     pub rare: bool,
     pub scarce: bool,
     pub seasonal: bool,

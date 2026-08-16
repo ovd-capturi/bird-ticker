@@ -90,6 +90,7 @@
     <!-- Tabs -->
     <div class="tabs">
       <button class="tab active" data-view="alerts">👁️ Observationer</button>
+      <button class="tab" data-view="social">📸 Socialt</button>
       <button class="tab" data-view="list">📋 Fugle</button>
       <button class="tab" data-view="ai">💬 Chat</button>
       <button class="tab" data-view="calendar">📅 Kalender</button>
@@ -135,6 +136,16 @@
           <p>Henter data...</p>
         </div>
       </div>
+    </div>
+
+    <!-- Social Feed View -->
+    <div id="view-social" style="display: none;">
+      <div class="feed-list" id="feed-list"></div>
+      <div class="feed-status" id="feed-status" style="display: none;">
+        <div class="spinner"></div>
+        <p>Henter…</p>
+      </div>
+      <div class="feed-sentinel" id="feed-sentinel"></div>
     </div>
 
     <!-- List View -->

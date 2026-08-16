@@ -64,6 +64,28 @@ fn parse_coord(s: &str) -> Option<f64> {
     s.replace(',', ".").parse().ok()
 }
 
+/// True for src values that look like an actual photo, so layout/spacer icons
+/// don't leak into the picture list. Query strings are ignored.
+fn looks_like_photo(src: &str) -> bool {
+    let path = src.split(['?', '#']).next().unwrap_or(src).to_ascii_lowercase();
+    [".jpg", ".jpeg", ".png", ".gif", ".webp"].iter().any(|ext| path.ends_with(ext))
+}
+
+/// Resolve a DOFbasen image reference to an absolute URL. Root-relative and
+/// scheme-relative hrefs are prefixed; already-absolute URLs pass through.
+fn absolutize(href: &str) -> String {
+    let h = href.trim();
+    if h.starts_with("http://") || h.starts_with("https://") {
+        h.to_string()
+    } else if let Some(rest) = h.strip_prefix("//") {
+        format!("https://{rest}")
+    } else if h.starts_with('/') {
+        format!("https://dofbasen.dk{h}")
+    } else {
+        format!("https://dofbasen.dk/{h}")
+    }
+}
+
 fn text_of(el: ElementRef) -> String {
     el.text().collect::<String>().trim().to_string()
 }
@@ -85,6 +107,17 @@ pub fn parse_observations(html: &str, _date_label: &str) -> Vec<Observation> {
     let right_a_sel = Selector::parse(r#"td[align="right"] a"#).unwrap();
     let arter_title_sel = Selector::parse("a.arter[title]").unwrap();
     let clock_sel = Selector::parse("i.fa-clock-o[title]").unwrap();
+    // Note ("bemærkning") sits in the title of a comment icon, mirroring the
+    // clock-icon convention above. `[class*="comment"]` covers fa-comment,
+    // fa-comment-o and fa-commenting-o without pinning one variant.
+    let note_sel = Selector::parse(r#"i[class*="comment"][title]"#).unwrap();
+    // Picture anchors carry class="lightbox" with the image-proxy URL in the
+    // href (current markup); a camera/picture icon child marks older markup.
+    let anchor_sel = Selector::parse("a").unwrap();
+    let photo_icon_sel = Selector::parse(r#"i[class*="camera"], i[class*="picture"]"#).unwrap();
+    let img_sel = Selector::parse("img").unwrap();
+    // Finer place detail (sub-site / exact spot) when DOFbasen supplies it.
+    let place_sel = Selector::parse(r#"[class*="sted"], [class*="delomr"]"#).unwrap();
 
     let blocks: Vec<Block> = SPECIES_RE
         .captures_iter(html)
@@ -173,6 +206,45 @@ pub fn parse_observations(html: &str, _date_label: &str) -> Vec<Observation> {
                 })
                 .unwrap_or_default();
 
+            // Free-text note from the comment icon's title.
+            let note = row
+                .select(&note_sel)
+                .next()
+                .and_then(|c| c.value().attr("title"))
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_default();
+
+            // Picture URLs: lightbox/photo-icon anchors, plus any inline
+            // thumbnails. De-duplicated, order preserved.
+            let mut pictures = Vec::new();
+            for a in row.select(&anchor_sel) {
+                if !has_class(a, "lightbox") && a.select(&photo_icon_sel).next().is_none() {
+                    continue;
+                }
+                if let Some(href) = a.value().attr("href").filter(|h| !h.trim().is_empty()) {
+                    let url = absolutize(href);
+                    if !pictures.contains(&url) {
+                        pictures.push(url);
+                    }
+                }
+            }
+            for img in row.select(&img_sel) {
+                if let Some(src) = img.value().attr("src").filter(|s| looks_like_photo(s)) {
+                    let url = absolutize(src);
+                    if !pictures.contains(&url) {
+                        pictures.push(url);
+                    }
+                }
+            }
+
+            // Finer place detail, when present.
+            let place = row
+                .select(&place_sel)
+                .next()
+                .map(text_of)
+                .filter(|t| !t.is_empty());
+
             if location.is_empty() {
                 continue;
             }
@@ -193,6 +265,9 @@ pub fn parse_observations(html: &str, _date_label: &str) -> Vec<Observation> {
                 observer,
                 behavior,
                 time,
+                note,
+                place,
+                pictures,
                 rare: sp.css_class == "su",
                 scarce: sp.css_class == "subart",
                 seasonal: sp.css_class == "seasonart",
@@ -264,6 +339,74 @@ mod tests {
         assert_eq!(&c[3], "defaultart");
         assert_eq!(&c[4], "Sortand");
         assert_eq!(&c[5], "Melanitta nigra");
+    }
+
+    /// An observation carrying a note, a photo and a place detail must surface
+    /// all three, while the pre-existing fields keep parsing unchanged.
+    #[test]
+    fn parses_note_picture_and_place() {
+        let html = r##"
+<a class="arter" href="/search/search1.php?art=02130" title="Alle observationer af Sortand i 2026"><span class="defaultart">Sortand</span></a> (<i>Melanitta nigra</i>):
+<table>
+  <tr>
+    <td align="right"><a class="arter" href="/search/search1.php?art=02130" title="Rastende">12</a></td>
+    <td><a class="lokalitet" onclick="visLok('loknr=1234')">Blåvand</a></td>
+    <td><span class="sted">Fyrhaven</span></td>
+    <td><a class="position" onclick="visKort('lng=8,08&lat=55,55')"><i class="fa fa-map-marker"></i></a></td>
+    <td><i class="fa fa-clock-o" title="Ophold på lokaliteten: 08:15-09:00"></i></td>
+    <td><i class="fa fa-comment-o" title="Trækkende mod syd, adult han"></i></td>
+    <td><a class="lightbox" rel="40024940" href='/image_proxy.php?mode=o&amp;pic=40024940_20260816053052_775068687.jpg' title="Sortand, 16/08/2026. Foto/copyright: Ole Ventzel"><i class="fa fa-picture-o blue"></i></a><a class="lightbox" rel="40024940" href='/image_proxy.php?mode=o&amp;pic=40024940_20260816053106_183796749.jpg' title="Sortand, 16/08/2026. Foto/copyright: Ole Ventzel"><i class="fa fa-picture-o blue"></i></a></td>
+    <td><a href="#" title="Information om observatøren"></a></td>
+    <td align="right"><a href="/observatoer.php?id=42">Ole Ventzel</a></td>
+    <td>&nbsp;</td>
+  </tr>
+</table>
+"##;
+        let obs = parse_observations(html, "fixture");
+        assert_eq!(obs.len(), 1, "one observation expected");
+        let o = &obs[0];
+        assert_eq!(o.species, "Sortand");
+        assert_eq!(o.count, 12);
+        assert_eq!(o.location, "Blåvand");
+        assert_eq!(o.observer, "Ole Ventzel");
+        assert_eq!(o.note, "Trækkende mod syd, adult han");
+        assert_eq!(o.place.as_deref(), Some("Fyrhaven"));
+        assert_eq!(
+            o.pictures,
+            vec![
+                "https://dofbasen.dk/image_proxy.php?mode=o&pic=40024940_20260816053052_775068687.jpg",
+                "https://dofbasen.dk/image_proxy.php?mode=o&pic=40024940_20260816053106_183796749.jpg",
+            ]
+        );
+    }
+
+    /// Observations without the new detail fields must still parse cleanly with
+    /// empty defaults — no behaviour change for the common case.
+    #[test]
+    fn parses_observation_without_details() {
+        let html = r#"
+<a class="arter" href="/search/search1.php?art=02130" title="Alle observationer af Sortand i 2026"><span class="defaultart">Sortand</span></a> (<i>Melanitta nigra</i>):
+<table>
+  <tr>
+    <td align="right"><a class="arter" href="/search/search1.php?art=02130" title="Rastende">3</a></td>
+    <td><a class="lokalitet" onclick="visLok('loknr=1234')">Blåvand</a></td>
+    <td>&nbsp;</td>
+    <td><i class="fa fa-clock-o" title="Ophold på lokaliteten: 10:00"></i></td>
+    <td>&nbsp;</td>
+    <td>&nbsp;</td>
+    <td>&nbsp;</td>
+    <td>&nbsp;</td>
+    <td align="right"><a href="/observatoer.php?id=42">Ole Ventzel</a></td>
+    <td>&nbsp;</td>
+  </tr>
+</table>
+"#;
+        let obs = parse_observations(html, "fixture");
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert_eq!(o.note, "");
+        assert_eq!(o.place, None);
+        assert!(o.pictures.is_empty());
     }
 
     /// Fixture-driven parity dump: set BIRD_OBS_FIXTURE (raw ISO-8859-1 bytes)

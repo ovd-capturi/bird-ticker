@@ -90,6 +90,12 @@ pub async fn refresh_observations_for_date(st: &AppState, date: Option<String>) 
             if let Some(db) = &db {
                 resolve_coords(db, &http, &mut obs).await;
                 db.upsert_observations(&eff, &obs).await.map_err(|e| e.to_string())?;
+                // Refresh `raw` on rows that already existed (e.g. scraped before
+                // note/pictures existed) — upsert's DO NOTHING leaves them stale.
+                // A failed patch must not fail the refresh.
+                if let Err(e) = db.patch_observation_raw(&eff, &obs).await {
+                    tracing::error!("patch_observation_raw failed for {eff}: {e}");
+                }
             }
             Ok::<u64, String>(obs.len() as u64)
         })

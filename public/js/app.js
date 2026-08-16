@@ -33,6 +33,8 @@ const App = {
   chatBusy: false,
   chatLoaded: false,
   currentDate: todayDate(),
+  feed: { items: [], cursor: null, loading: false, exhausted: false, loaded: false },
+  _feedObserver: null,
   _expandedGroups: new Set(),
   _expandedRawRows: new Set(),
   _map: null,
@@ -120,6 +122,10 @@ const App = {
     });
 
     document.getElementById("btn-refresh").addEventListener("click", async () => {
+      if (this.currentView === "social") {
+        this.resetSocialFeed();
+        return;
+      }
       await this.getUserLocation();
       this.loadData(true);
     });
@@ -556,6 +562,7 @@ const App = {
     });
 
     document.getElementById("view-alerts").style.display = view === "alerts" ? "block" : "none";
+    document.getElementById("view-social").style.display = view === "social" ? "block" : "none";
     document.getElementById("view-list").style.display = view === "list" ? "block" : "none";
     document.getElementById("view-ai").classList.toggle("chat-open", view === "ai");
     document.body.classList.toggle("chat-active", view === "ai");
@@ -570,8 +577,135 @@ const App = {
       this.renderAlerts();
       if (this._map) requestAnimationFrame(() => this._map.resize());
     }
+    if (view === "social") this.openSocialFeed();
     if (view === "ai") this.openChat();
     if (view === "calendar") this.renderCalendarView();
+  },
+
+  // ─── Social Feed ───────────────────────────────────────────────
+  // First activation only: wire the IntersectionObserver and load page 1.
+  // Re-entering the tab keeps items and scroll position untouched.
+  openSocialFeed() {
+    this.initFeedObserver();
+    if (!this.feed.loaded) {
+      this.feed.loaded = true;
+      this.loadSocialPage();
+    }
+  },
+
+  // 🔄 while the social tab is active: clear everything and refetch page 1.
+  resetSocialFeed() {
+    this.feed = { items: [], cursor: null, loading: false, exhausted: false, loaded: true };
+    this._feedLastDate = null;
+    document.getElementById("feed-list").innerHTML = "";
+    window.scrollTo(0, 0);
+    // The observer may have been disconnected on exhaustion — rebind it.
+    if (this._feedObserver) this._feedObserver.disconnect();
+    this._feedObserver = null;
+    this.initFeedObserver();
+    this.loadSocialPage();
+  },
+
+  initFeedObserver() {
+    if (this._feedObserver) return;
+    const sentinel = document.getElementById("feed-sentinel");
+    if (!sentinel) return;
+    this._feedObserver = new IntersectionObserver((entries) => {
+      // The observer can fire repeatedly; loadSocialPage guards re-entry.
+      if (entries.some((e) => e.isIntersecting)) this.loadSocialPage();
+    }, { rootMargin: "400px" });
+    this._feedObserver.observe(sentinel);
+  },
+
+  async loadSocialPage() {
+    if (this.feed.loading || this.feed.exhausted) return;
+    this.feed.loading = true;
+    const status = document.getElementById("feed-status");
+    if (status) status.style.display = "block";
+
+    try {
+      const page = await Scraper.fetchSocialFeed({ cursor: this.feed.cursor });
+      const items = Array.isArray(page.items) ? page.items : [];
+      this.feed.items.push(...items);
+      this.feed.cursor = page.nextCursor || null;
+      if (!page.nextCursor) {
+        this.feed.exhausted = true;
+        if (this._feedObserver) this._feedObserver.disconnect();
+      }
+      if (this.feed.items.length === 0) {
+        this.renderFeedEmpty();
+      } else {
+        this.appendFeedItems(items);
+      }
+    } catch (err) {
+      console.warn("Failed to fetch social feed:", err);
+      // Stop hammering a failing endpoint; 🔄 can retry.
+      this.feed.exhausted = true;
+      if (this._feedObserver) this._feedObserver.disconnect();
+      if (this.feed.items.length === 0) {
+        this.renderFeedEmpty("Kunne ikke hente feedet. Prøv igen med 🔄.");
+      }
+    } finally {
+      this.feed.loading = false;
+      if (status) status.style.display = "none";
+    }
+  },
+
+  renderFeedEmpty(message) {
+    document.getElementById("feed-list").innerHTML = `
+      <div class="empty-state">
+        <div class="emoji">📸</div>
+        <p>${esc(message || "Ingen billeder eller noter at vise endnu")}</p>
+      </div>`;
+  },
+
+  // Append a page of cards, inserting a day divider whenever the date changes
+  // from the last card rendered so far (feed is globally sorted newest-first).
+  appendFeedItems(items) {
+    const list = document.getElementById("feed-list");
+    let html = "";
+    for (const obs of items) {
+      const date = obs.date || "";
+      if (date !== this._feedLastDate) {
+        html += `<div class="feed-day">${esc(formatDateLabel(date))}</div>`;
+        this._feedLastDate = date;
+      }
+      html += this.feedCardHtml(obs);
+    }
+    list.insertAdjacentHTML("beforeend", html);
+  },
+
+  feedCardHtml(obs) {
+    const pictures = Array.isArray(obs.pictures) ? obs.pictures : [];
+    // Hide an image that fails to load rather than showing a broken box.
+    const onerr = "this.closest('.feed-photo').style.display='none'";
+    const photos = pictures
+      .map((url, i) => `<a class="feed-photo" href="${esc(url)}" target="_blank" rel="noopener"><img src="${esc(url)}" alt="Foto ${i + 1}" loading="lazy" onerror="${onerr}"></a>`)
+      .join("");
+
+    let meta = '<div class="feed-meta">';
+    if (obs.time) meta += `<div>🕐 ${esc(obs.time)}</div>`;
+    if (obs.place) meta += `<div>📌 ${esc(obs.place)}</div>`;
+    if (obs.behavior) meta += `<div>📋 ${esc(obs.behavior)}</div>`;
+    if (obs.observer) meta += `<div>👤 ${esc(obs.observer)}</div>`;
+    meta += "</div>";
+
+    const count = obs.count ? ` <span class="feed-count">${esc(String(obs.count))} stk</span>` : "";
+    const latin = obs.latin ? `<div class="feed-latin">${esc(obs.latin)}</div>` : "";
+    const loc = obs.location ? `<div class="feed-loc">📍 ${esc(obs.location)}</div>` : "";
+    const note = obs.note ? `<div class="feed-note">💬 ${esc(obs.note)}</div>` : "";
+
+    return `
+      <article class="feed-card">
+        ${photos ? `<div class="feed-photos">${photos}</div>` : ""}
+        <div class="feed-body">
+          <div class="feed-species">${esc(obs.species || "Ukendt art")}${count}</div>
+          ${latin}
+          ${loc}
+          ${note}
+          ${meta}
+        </div>
+      </article>`;
   },
 
   async saveSettings() {
@@ -1124,14 +1258,23 @@ const App = {
     content += '<div class="obs-meta">';
     content += `<div class="obs-time">🕐 ${esc(item.time) || "Ukendt tid"}</div>`;
     content += item.distance != null ? `<div class="obs-distance">📍 ${item.distance} km</div>` : "";
+    content += item.place ? `<div class="obs-place">📌 ${esc(item.place)}</div>` : "";
     content += item.observer ? `<div class="obs-observer">👤 ${esc(item.observer)}</div>` : "";
     content += item.behavior ? `<div class="obs-behavior">📋 ${esc(item.behavior)}</div>` : "";
     content += '</div>';
+    content += item.note ? `<div class="obs-note">💬 ${esc(item.note)}</div>` : "";
+    const pictures = Array.isArray(item.pictures) ? item.pictures : [];
+    if (pictures.length) {
+      const thumbs = pictures
+        .map((url, i) => `<a href="${esc(url)}" target="_blank" rel="noopener" class="obs-photo" title="Foto ${i + 1}"><img src="${esc(url)}" alt="Foto ${i + 1}" loading="lazy"></a>`)
+        .join("");
+      content += `<div class="obs-pictures">${thumbs}</div>`;
+    }
     content += '</div>';
 
     return {
       key: `o:${item.species}|${item.latin}|${item.location}|${item.loknr || ""}|${item.time || ""}|${item.observer || ""}`,
-      sig: `${item.count || 0}|${item.time || ""}|${item.observer || ""}|${item.behavior || ""}|${item.lat ?? ""}|${item.lng ?? ""}|${item.distance ?? ""}`,
+      sig: `${item.count || 0}|${item.time || ""}|${item.observer || ""}|${item.behavior || ""}|${item.lat ?? ""}|${item.lng ?? ""}|${item.distance ?? ""}|${item.place || ""}|${item.note || ""}|${pictures.join(",")}`,
       outerClass: "bird-tree-item bird-tree-item--obs",
       html: content,
     };

@@ -79,6 +79,19 @@ const Scraper = {
     return res.json();
    },
 
+   // Fetch a page of the cross-day social feed (newest first). Pass the
+   // previous page's nextCursor to page backwards in time; omit for page 1.
+  async fetchSocialFeed({ limit = 30, cursor = null } = {}) {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (cursor) params.set("cursor", cursor);
+    const res = await fetch(`${API_BASE}/api/social-feed?${params.toString()}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    return res.json();
+   },
+
    // Fetch full species name -> artId map from DOFbasen
   async fetchSpeciesMap() {
     const url = `${API_BASE}/api/species-map`;

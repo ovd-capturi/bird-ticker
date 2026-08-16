@@ -158,6 +158,57 @@ impl Db {
         Ok(rows.iter().map(obs_row_to_json).collect())
     }
 
+    /// Cross-day social feed: newest-first observations that have at least one
+    /// picture OR a non-empty note. Paged with a row-wise keyset cursor
+    /// `(obs_date, coalesce(raw->>'time',''), id)` so paging stays index-friendly
+    /// (see migration 011). The filter is written to match that partial index's
+    /// predicate character-for-character. Each row is built with `obs_row_to_json`
+    /// plus a `date` key. `cursor` is `(date, time, id)` of the previous page's
+    /// last item, omitted for the first page.
+    pub async fn get_social_feed(
+        &self,
+        limit: i64,
+        cursor: Option<(String, String, i64)>,
+    ) -> anyhow::Result<Vec<Value>> {
+        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+            "SELECT id, to_char(obs_date, 'YYYY-MM-DD') AS date,
+                    species, latin, location, loknr, lat, lng, observer, count, behaviour, raw
+             FROM observations
+             WHERE ((raw->'pictures' IS NOT NULL AND raw->'pictures' <> '[]'::jsonb)
+                    OR coalesce(raw->>'note', '') <> '')",
+        );
+        if let Some((date, time, id)) = cursor {
+            qb.push(" AND (obs_date, coalesce(raw->>'time', ''), id) < (")
+                .push_bind(date)
+                .push("::date, ")
+                .push_bind(time)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        qb.push(
+            " ORDER BY obs_date DESC, coalesce(raw->>'time', '') DESC, id DESC LIMIT ",
+        )
+        .push_bind(limit);
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let mut v = obs_row_to_json(r);
+                if let Value::Object(m) = &mut v {
+                    let date: Option<String> = r.try_get("date").ok().flatten();
+                    m.insert("date".to_string(), date.map(Value::from).unwrap_or(Value::Null));
+                    // `id` is a typed column absent from `raw`; the feed cursor
+                    // needs it, so surface it explicitly.
+                    let id: Option<i64> = r.try_get("id").ok();
+                    m.insert("id".to_string(), id.map(Value::from).unwrap_or(Value::Null));
+                }
+                v
+            })
+            .collect())
+    }
+
     /// Average coords per locality, derived from stored observations. Every
     /// requested loknr is present in the map (null/null if unseen).
     pub async fn get_locality_coords(&self, loknrs: &[String]) -> anyhow::Result<HashMap<String, LocalityCoord>> {
@@ -659,6 +710,46 @@ impl Db {
 
         tx.commit().await?;
         Ok(n)
+    }
+
+    /// Refresh the stored `raw` blob of already-inserted rows for `date` from a
+    /// freshly scraped batch, without touching typed columns, `scrape_log`, or
+    /// the bucket tables. This is the companion to `upsert_observations`'s
+    /// `DO NOTHING`: a re-scrape of a past date inserts nothing, so old rows
+    /// scraped before `note`/`pictures` existed would never gain them without
+    /// this patch. Rows are matched on the same dedup key
+    /// `(obs_date, latin, loknr, observer, behaviour)` — nullable columns via
+    /// `IS NOT DISTINCT FROM` (`loknr`/`observer` are nullable and `behaviour`
+    /// is always NULL) — and only updated where `raw` actually changes.
+    /// Returns the number of rows whose `raw` was rewritten.
+    pub async fn patch_observation_raw(&self, date: &str, observations: &[Observation]) -> anyhow::Result<u64> {
+        if observations.is_empty() {
+            return Ok(0);
+        }
+        let obs_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
+
+        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("UPDATE observations SET raw = v.raw FROM (");
+        qb.push_values(observations, |mut b, o| {
+            // Cast every placeholder so the VALUES column types are unambiguous
+            // even when the first row's loknr/observer is NULL.
+            b.push_bind(obs_date).push_unseparated("::date");
+            b.push_bind(o.latin.clone()).push_unseparated("::text");
+            b.push_bind(o.loknr.clone()).push_unseparated("::text");
+            b.push_bind(none_if_empty(&o.observer)).push_unseparated("::text");
+            b.push_bind(serde_json::to_value(o).unwrap()).push_unseparated("::jsonb");
+        });
+        qb.push(
+            ") AS v(obs_date, latin, loknr, observer, raw)
+             WHERE observations.obs_date = v.obs_date
+               AND observations.latin = v.latin
+               AND observations.loknr IS NOT DISTINCT FROM v.loknr
+               AND observations.observer IS NOT DISTINCT FROM v.observer
+               AND observations.behaviour IS NULL
+               AND observations.raw IS DISTINCT FROM v.raw",
+        );
+
+        let res = qb.build().execute(&self.pool).await?;
+        Ok(res.rows_affected())
     }
 }
 
